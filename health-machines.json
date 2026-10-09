@@ -1,0 +1,27 @@
+{
+  "laptop": {
+    "os": "macos",
+    "local": true,
+    "thresholds": {
+      "disk": 0,
+      "disk_gb": 10
+    }
+  },
+  "mini": {
+    "os": "macos",
+    "ssh": "mac-mini-herdr",
+    "thresholds": {
+      "disk": 0,
+      "disk_gb": 12
+    }
+  },
+  "siso-vps": {
+    "os": "linux",
+    "ssh": "siso-vps"
+  },
+  "halo-vps": {
+    "os": "linux",
+    "ssh": "halo-vps",
+    "client": true
+  }
+}

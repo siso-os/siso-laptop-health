@@ -1,0 +1,8 @@
+# Servers and processes `laptop-health strays` must never flag, one regex per line (matched against the full
+# command line), then " # why". Add to this when Shaan says a thing is his, not when it merely looks busy.
+registry/curated                 # :8812 curated UI bank board (HALO Streaming review board, marks.jsonl)
+\.claude/console/server\.mjs     # :8891 SISO console
+camofox-browser                  # :9377 headless browser for agents
+siso-agent-base-local            # :8890 agent base edge (launchd)
+SISO Internal\.app               # :3001 Internal Labs local api
+codex-router                     # :4200-4208 Codex's local router

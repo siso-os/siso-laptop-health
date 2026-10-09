@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Low cost, sustained health alerts for the machines in health-machines.json."""
+import datetime, json, os, re, subprocess, sys, tempfile, threading, time
+
+HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOME = os.path.expanduser('~')
+CACHE = os.path.join(HOME, '.cache', 'health-watch')
+A0_INBOX = os.path.join(HOME, 'SISO_Workspace/SISO_Agents/agent-zero/siso-firstmate/.agents/a0/inbox.log')
+STATE = os.path.join(CACHE, 'state.json')
+WAKE = os.path.join(HOUSE, '.agents', 'wake.jsonl')
+LABEL = 'com.siso.health-watch'
+DEFAULTS = {'load': 1.5, 'pressure': 40, 'ram': 10, 'disk': 10, 'disk_gb': 3, 'unreachable': 15}
+# disk_gb: absolute floor, 2 samples. On a big disk 'disk < 10 %' stays open for days and never wakes again; 24 Sep, 137 MB free crashed herdr and every agent
+MASK = re.compile(r'(?i)(--token(?:=|\s+)|\btoken=|\bkey=|\bsecret=|\bpassword=|\bBearer\s+)([^\s]+)')
+URL_CRED = re.compile(r'(://[^/\s:@]+:)[^@\s]+@')  # postgres://user:PASSWORD@host (2 Oct: a convex backend's args carried one)
+
+
+def safe(s):
+    return MASK.sub(r'\1***', URL_CRED.sub(r'\1***@', str(s)))
+
+
+def parse_sample(osname, text):
+    lines = text.splitlines()
+    if osname == 'linux':
+        cores = int(lines[0]); load = float(lines[1].split()[1]); pressure = 0.0
+        for line in lines[2:]:
+            if line.startswith('some '):
+                m = re.search(r'avg60=([\d.]+)', line)
+                if m: pressure = float(m.group(1))
+        memtotal = memavail = None; disk = None
+        for line in lines:
+            if line.startswith('MemTotal:'): memtotal = int(line.split()[1])
+            if line.startswith('MemAvailable:'): memavail = int(line.split()[1])
+            if line.startswith('/'):
+                fields = line.split()
+                if len(fields) >= 5: disk = 100 * int(fields[3]) / int(fields[1]); disk_gb = int(fields[3]) / 1048576
+        if not cores or not memtotal or memavail is None or disk is None: raise ValueError('incomplete Linux sample')
+        return {'cores': cores, 'load5': load, 'pressure': pressure, 'ram': 100 * memavail / memtotal, 'disk': disk, 'disk_gb': disk_gb}
+    cores = int(lines[0]); loadline = lines[1]
+    loads = re.findall(r'[\d.]+', loadline)
+    load = float(loads[1] if len(loads) > 1 else loads[0])
+    ps = re.search(r'page size of (\d+) bytes', text)
+    page = int(ps.group(1)) if ps else 4096  # Apple silicon pages are 16384; 4096 under-reported RAM 4x (2 Oct)
+    stats = {}
+    for line in lines[2:]:
+        m = re.match(r'([^:]+):\s+(\d+)', line)
+        if m: stats[m.group(1).strip()] = int(m.group(2))
+    # sysctl memsize follows vm_stat; df is last.
+    idx = next(i for i,x in enumerate(lines) if x.startswith('Mach Virtual Memory Statistics'))
+    memsize = int(next(x for x in lines[idx+1:] if x.isdigit()))
+    available = sum(stats.get(k, 0) for k in ('Pages free', 'Pages inactive', 'Pages speculative', 'Pages purgeable')) * page
+    df = next(x.split() for x in lines if x.startswith('/dev/') or x.startswith('map '))
+    disk = 100 * int(df[3]) / int(df[1])
+    return {'cores': cores, 'load5': load, 'pressure': None, 'ram': 100 * available / memsize, 'disk': disk, 'disk_gb': int(df[3]) / 1048576}
+
+
+def run(cmd, timeout=12):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True).stdout
+
+
+MAC_TIMEOUT = "perl -e 'alarm 10; exec @ARGV' "  # macOS has no timeout(1); the alarm kills the remote command with the pass
+
+
+def ssh_cmd(cfg, cmd):
+    return ['ssh', '-o','BatchMode=yes','-o','ConnectTimeout=5','-o','RequestTTY=no','-o','RemoteCommand=none','-o','ControlMaster=auto',
+            '-o','ControlPersist=10m','-o',f"ControlPath={HOME}/.ssh/cm-health-%r@%h:%p", cfg['ssh'], cmd]
+
+
+
+def charge_ma(text):
+    """Battery current in mA while on AC (>0 charging, <0 draining), from `ioreg -rn AppleSmartBattery`; 9999 when it does not apply
+    (on battery, 90%+ full, or no battery). 3 Oct 2026: the Mac sat on a charger at 6% with +145 mA and nobody was told."""
+    ext = re.search(r'"ExternalConnected" = (\w+)', text); pct = re.search(r'"CurrentCapacity" = (\d+)', text)
+    amp = re.search(r'"InstantAmperage" = (-?\d+)', text)
+    if not (ext and pct and amp) or ext.group(1) != 'Yes' or int(pct.group(1)) >= 90: return 9999.0
+    a = int(amp.group(1)); a = a - 2**64 if a > 2**63 else a
+    return float(a)
+
+
+def sample(machine, cfg):
+    osname = cfg['os']
+    if osname == 'linux': cmd = "timeout 10 sh -c 'nproc; cat /proc/loadavg; grep some /proc/pressure/cpu; grep -E \"MemTotal|MemAvailable\" /proc/meminfo; df -Pk /'"
+    else: cmd = MAC_TIMEOUT + "sh -c 'sysctl -n hw.ncpu vm.loadavg; vm_stat; sysctl -n hw.memsize; df -Pk /System/Volumes/Data'"
+    if cfg.get('local'):
+        # macOS vm.loadavg is formatted as { 1.00 2.00 3.00 }, not a bare number.
+        raw = run(['/bin/sh', '-c', cmd])
+    else:
+        raw = run(ssh_cmd(cfg, cmd))
+    v = parse_sample(osname, raw)
+    if cfg.get('local') and osname == 'macos':
+        try: v['charge_ma'] = charge_ma(run(['ioreg', '-rn', 'AppleSmartBattery']))
+        except Exception: v['charge_ma'] = 9999.0
+    return v
+
+
+def load_state():
+    try:
+        with open(STATE) as f: return json.load(f)
+    except (OSError, ValueError): return {}
+
+
+def append(obj):
+    os.makedirs(os.path.dirname(WAKE), exist_ok=True)
+    with open(WAKE, 'a') as f: f.write(json.dumps(obj) + '\n')
+
+
+def tell(msg):
+    try:
+        run(['laptop-health', 'tell', 'HEALTH', msg], timeout=20); return True
+    except Exception: return False
+
+
+def top(cfg):
+    cmd = "timeout 10 ps -eo pcpu,user,etime,comm --sort=-pcpu | head -14" if cfg['os'] == 'linux' else MAC_TIMEOUT + "sh -c 'ps -Ao pcpu,user,etime,comm -r | head -14'"
+    argv = ['/bin/sh', '-c', cmd] if cfg.get('local') else ssh_cmd(cfg, cmd)  # the machine's own processes, not the laptop's
+    try: rows = run(argv, timeout=12).splitlines()[1:]
+    except Exception: return []
+    own = {'ps', 'sh', 'head', 'timeout', 'perl'}  # the sampling command itself, not a consumer
+    return [safe(x) for x in rows if x.split()[-1:] and x.split()[-1].rsplit('/', 1)[-1] not in own][:7]
+
+
+def one(machine, cfg, state):
+    now = datetime.datetime.now().astimezone().isoformat(timespec='seconds'); mstate = state.setdefault(machine, {})
+    try:
+        v = sample(machine, cfg); failed = False
+    except Exception as e:
+        v = {}; failed = True
+    thresholds = dict(DEFAULTS, **cfg.get('thresholds', {})); breached = {}
+    if failed:
+        breached['unreachable'] = (1, thresholds['unreachable'])
+    else:
+        breached['load'] = (v['load5'], thresholds['load'] * v['cores'])
+        if cfg['os'] == 'linux': breached['pressure'] = (v['pressure'], thresholds['pressure'])
+        breached['ram'] = (v['ram'], thresholds['ram']); breached['disk'] = (v['disk'], thresholds['disk'])
+        breached['disk_gb'] = (v['disk_gb'], thresholds['disk_gb'])
+        if 'charge_ma' in v: breached['charge_ma'] = (v['charge_ma'], thresholds.get('charge_ma', 300))
+    output = {'machine': machine, **v, 'status': 'unreachable' if failed else 'sampled'}
+    mstate['last_sample'] = now
+    for metric, (value, limit) in breached.items():
+        bad = failed if metric == 'unreachable' else (value > limit if metric in ('load','pressure') else value < limit)
+        rec = mstate.setdefault(metric, {'count': 0, 'clean_count': 0, 'open': False, 'opened_at': None, 'last_told_at': None})
+        rec['count'] = rec['count'] + 1 if bad else 0
+        rec['clean_count'] = 0 if bad else rec.get('clean_count', 0) + 1
+        needed = thresholds['unreachable'] if metric == 'unreachable' else 2 if metric == 'disk_gb' else 10 if metric == 'charge_ma' else 5
+        if rec['count'] >= needed and not rec['open']:
+            rec.update(open=True, opened_at=now, last_told_at=time.time())
+            names = top(cfg); note = ' ours-should-yield' if cfg.get('client') and not failed and v['load5'] > .75*v['cores'] else ''
+            if metric == 'charge_ma': note = ' (on the charger but the battery is not gaining: swap cable/port, check the adapter, display holds, load)'
+            msg = f"{datetime.datetime.now().strftime('%H:%M')} WAKE {machine} {metric} {value:.1f} (limit {limit:.1f}) for 5 min{note}; top: {'; '.join(names[:3])}"
+            ok = tell(msg); append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'opened','top':names,'told':ok})
+            rec['pending'] = None if ok else msg; rec['tries'] = 0
+        elif rec['open'] and rec['clean_count'] >= 5:
+            rec.update(open=False, opened_at=None, last_told_at=None)
+            ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} CLEARED {machine} {metric}")
+            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'cleared','top':[],'told':ok})
+        elif rec['open'] and time.time() - (rec.get('last_told_at') or 0) >= 7200:
+            rec['last_told_at'] = time.time(); ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} STILL {machine} {metric} {value:.1f} (limit {limit:.1f})")
+            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'still','top':[],'told':ok})
+        if rec.get('pending'):  # 2 Oct 17:13: a wake whose tell failed (busy input box, pane moved) was never retried; Shaan's laptop sat at load 16 unannounced
+            rec['tries'] = rec.get('tries', 0) + 1
+            if tell(rec['pending']): rec['pending'] = None
+            elif rec['tries'] >= 3:
+                with open(A0_INBOX, 'a') as f: f.write(f"{datetime.datetime.now().strftime('%H:%M')} HEALTH-WATCH (HEALTH pane unreachable 3x): {rec['pending'][:300]}\n")
+                rec['pending'] = None
+    return output
+
+
+def once():
+    with open(os.path.join(HOUSE, 'health-machines.json')) as f: machines = json.load(f)
+    state = load_state(); results = {}; lock = threading.Lock()
+    def worker(k,c):
+        r = one(k,c,state)
+        with lock: results[k] = r
+    threads = [threading.Thread(target=worker,args=x) for x in machines.items()]
+    for t in threads: t.start()
+    for t in threads: t.join(30)
+    for k in machines:
+        print(json.dumps(results.get(k, {'machine':k,'status':'timeout'}), sort_keys=True))
+    os.makedirs(CACHE, exist_ok=True)
+    with open(STATE+'.tmp','w') as f: json.dump(state,f)
+    os.replace(STATE+'.tmp', STATE)
+    # A0 2 Oct: builds/tests on the laptop outside `heavy` are throttled, their owner told, an issue kept (laptop-health unheavy)
+    try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'unheavy', '--enforce'], timeout=40).strip()[-600:])
+    except Exception as e: print(f'unheavy failed: {e}')
+    # A0 2 Oct 17:55: free memory before the laptop thrashes (laptop-health ramguard; dry-run unless ~/.cache/health-watch/ram-guard.on)
+    try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'ramguard'], timeout=90).splitlines()[0][:200])
+    except Exception as e: print(f'ramguard failed: {e}')
+
+
+def main(args):
+    plist = os.path.join(HOME,'Library/LaunchAgents',LABEL+'.plist')
+    if args == ['--once']: once(); return
+    if args == ['status']:
+        s = load_state()
+        for machine in json.load(open(os.path.join(HOUSE,'health-machines.json'))):
+            alerts = [k for k,v in s.get(machine,{}).items() if isinstance(v, dict) and v.get('open')]
+            print(f"{machine}: last sample {s.get(machine,{}).get('last_sample','unknown')}; open alerts {','.join(alerts) or 'none'}")
+        return
+    if args in (['--install'], ['--uninstall']):
+        if args[0] == '--uninstall':
+            if os.path.exists(plist): os.remove(plist)
+            print('removed '+plist); return
+        os.makedirs(os.path.dirname(plist),exist_ok=True); os.makedirs(CACHE,exist_ok=True)
+        path='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:'+os.path.join(HOME,'.local/bin')
+        py='/opt/homebrew/bin/python3' if os.path.exists('/opt/homebrew/bin/python3') else sys.executable
+        with open(plist,'w') as f: f.write(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array><string>{py}</string><string>{os.path.realpath(__file__)}</string><string>--once</string></array><key>StartInterval</key><integer>60</integer><key>Nice</key><integer>10</integer><key>ProcessType</key><string>Background</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict><key>StandardOutPath</key><string>{CACHE}/watch.log</string><key>StandardErrorPath</key><string>{CACHE}/watch.log</string></dict></plist>''')
+        print('wrote '+plist+' (not loaded)'); return
+    print('usage: health-watch --once | status | --install | --uninstall'); sys.exit(2)
+
+if __name__ == '__main__': main(sys.argv[1:])

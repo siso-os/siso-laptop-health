@@ -1,0 +1,7 @@
+{
+ "_about": "Slim profiles for worktrees: tracked folders an agent's worktree does not need, left out with git sparse-checkout (reversible: `git sparse-checkout disable` in that worktree brings them back). Keyed by the main checkout's folder name. Only big, write-once material: run evidence, review screenshots, archived docs. Measured 25 Sep 2026 on oracle set-b: 2,177 MB tracked, these paths ~1,100 MB.",
+ "oracle-streaming": {
+  "exclude": ["/.agents/runs/", "/.uihub/decide/", "/.uihub/_shots/", "/.uihub/flow-map/", "/docs/archive/"],
+  "keep_note": ".uihub/dashboard and .uihub/review-board are read by the app (dest/main/index.ts, dev-web/main.web.ts): kept"
+ }
+}

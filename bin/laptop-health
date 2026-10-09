@@ -1,0 +1,1609 @@
+#!/usr/bin/env python3
+"""laptop-health: find out why Shaan's MacBook is slow, in the order that has paid off.
+
+  laptop-health [check] [--json]   10 s triage: power + Low Power Mode, CPU capacity, load, RAM, strays; ranked causes
+  laptop-health load [secs]        who makes up the load average (running threads per process, sudo), default 30 s
+  laptop-health churn [secs]       what keeps starting processes (every fork/exec via eslogger, sudo), default 30 s
+  laptop-health mem                real memory (incl. compressed) grouped by kind, and the biggest processes
+  laptop-health strays [--apply K] leftovers: dead-session waiters, ownerless dev servers, idle Chromes, orphan loops;
+                                   dry run by default; --apply all|waiters,servers,chrome,axi,loops,monitors
+  laptop-health clean              stop every stray (= strays --apply all); never touches an agent
+  laptop-health hogs [secs] [--tell] the load by owning agent (herdr pane) with waste tips from tips.json; --tell
+                                   messages those agents (only into an empty input box, once an hour per tip)
+  laptop-health servers           every dev/file server: RAM, age, clients, folder, which agent owns it
+  laptop-health disk [scan|trees|slim|caches|cargo]  free space + trend; `scan` full du compared with the last (what grew);
+                                   `trees` every worktree (size, idle, active, slimmable); `slim --idle [--run]` leaves
+                                   sparse.json folders out of idle worktrees (reversible); `caches` regenerable caches
+                                   `cargo [--run]` stale Rust build caches (watch clears them under 25 GB)
+  laptop-health who <pid>          the process chain up to its agent pane (or launchd service), and any waste tip
+  laptop-health tell <pane|name> "msg"  type one line into an agent's pane, only if its input box is empty
+  laptop-health watch [--install|--uninstall|--once]  the persistent job: every 10 min, log check + hogs to
+                                   ~/.cache/laptop-health/watch.jsonl and tell agents behind waste (launchd)
+  laptop-health history            power source + Low Power Mode timeline and active agent sessions per hour
+  laptop-health agent [...]        open the laptop-health agent in its own herdr tab (= health tab ...)
+
+Exit codes for `check`: 0 healthy, 1 degraded, 2 critical. Never kills an agent. See AGENTS.md for the playbook.
+"""
+import collections, ctypes, datetime, glob, json, os, re, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+NCPU = os.cpu_count() or 8
+
+
+def sh(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+def short(s, n=100):
+    return (s or "").replace(HOME, "~")[:n]
+
+
+def have_sudo():
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+
+
+def secs(t):
+    d = 0
+    if "-" in t:
+        d, t = t.split("-", 1); d = int(d)
+    p = [float(x) for x in t.split(":")]
+    while len(p) < 3:
+        p.insert(0, 0.0)
+    return d * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+
+
+def mb(s):
+    m = re.match(r"([\d.]+)([BKMG])", s or "")
+    return float(m.group(1)) * {"B": 1 / 1048576, "K": 1 / 1024, "M": 1, "G": 1024}[m.group(2)] if m else 0.0
+
+
+def ps_rows():
+    rows = {}
+    for line in sh("ps -Ao pid=,ppid=,etime=,time=,args=").splitlines():
+        p = line.split(None, 4)
+        if len(p) == 5:
+            rows[int(p[0])] = {"ppid": int(p[1]), "age": secs(p[2]), "cpu": secs(p[3]), "args": p[4]}
+    return rows
+
+
+# ---------------------------------------------------------------- probes
+
+def power():
+    batt = sh("pmset -g batt")
+    src = "AC" if "AC Power" in batt else "Battery" if "Battery Power" in batt else "?"
+    m = re.search(r"(\d+)%;\s*([^;]+);\s*([^\s]+)", batt)
+    lpm = {}
+    cur = None
+    for line in sh("pmset -g custom").splitlines():
+        if line.strip().endswith("Power:"):
+            cur = "Battery" if "Battery" in line else "AC"
+        m2 = re.match(r"\s*lowpowermode\s+(\d)", line)
+        if m2 and cur:
+            lpm[cur] = m2.group(1) == "1"
+    return {"source": src, "percent": int(m.group(1)) if m else None, "state": m.group(2).strip() if m else "",
+            "remaining": m.group(3) if m else "", "low_power_mode_now": lpm.get(src, False), "low_power_mode": lpm}
+
+
+def capacity():
+    """E/P cluster frequency and residency from powermetrics (needs sudo). Low Power Mode shows as capped P-cores."""
+    if not have_sudo():
+        return {"error": "needs passwordless sudo for powermetrics"}
+    out = sh("sudo -n /usr/bin/powermetrics --samplers cpu_power,thermal -n 1 -i 1000", timeout=20)
+    clusters = {}
+    for m in re.finditer(r"^(\w+)-Cluster HW active frequency: (\d+) MHz", out, re.M):
+        clusters[m.group(1)] = {"mhz": int(m.group(2))}
+    for m in re.finditer(r"^(\w+)-Cluster HW active residency:\s+([\d.]+)% \(([^)]*)\)", out, re.M):
+        freqs = [int(f) for f in re.findall(r"(\d+) MHz", m.group(3))]
+        clusters.setdefault(m.group(1), {}).update({"active_pct": float(m.group(2)), "max_mhz": max(freqs) if freqs else None})
+    cores = [float(x) for x in re.findall(r"^CPU \d+ active residency:\s+([\d.]+)%", out, re.M)]
+    th = re.search(r"Current pressure level: (\w+)", out)
+    return {"clusters": clusters, "core_active_pct": cores, "thermal": th.group(1) if th else "?"}
+
+
+def memory():
+    top = sh("top -l 1 -n 0 -s 0")
+    m = re.search(r"PhysMem: (\S+) used \((\S+) wired, (\S+) compressor\), (\S+) unused", top)
+    sw = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M", sh("sysctl -n vm.swapusage"))
+    return {"free_mb": round(mb(m.group(4))) if m else None, "compressor_mb": round(mb(m.group(3))) if m else None,
+            "swap_used_mb": round(float(sw.group(2))) if sw else None, "swap_total_mb": round(float(sw.group(1))) if sw else None}
+
+
+def loadavg():
+    return [float(x) for x in re.findall(r"[\d.]+", sh("sysctl -n vm.loadavg"))[:3]]
+
+
+def kind_of(a):
+    if re.search(r"/\.local/bin/omp|(^|/)omp ", a): return "omp workers"
+    if re.search(r"(^|/)claude( |$)|/claude/versions/|\.local/bin/claude", a): return "Claude sessions"
+    if "codex-router" in a: return "codex router (local proxy)"
+    if "codex" in a.lower() and "ChatGPT.app" not in a: return "codex"
+    if "Google Chrome" in a or "chrome-headless" in a: return "Chrome"
+    if "Arc.app" in a: return "Arc"
+    if "cmux.app" in a: return "cmux"
+    if "WebKit" in a: return "WebKit views (cmux/apps)"
+    if re.search(r"\bvite\b|next dev|webpack|esbuild", a): return "dev servers"
+    if re.search(r"\btsc\b|vitest|typescript/lib", a): return "tsc/vitest"
+    if re.search(r"tsserver|language_servers|pyright|serena", a): return "language servers"
+    if a.startswith(("/System/", "/usr/", "/sbin/", "/Library/Apple")): return "macOS"
+    m = re.search(r"/Applications/([^/]+)\.app", a)
+    if m: return m.group(1)
+    first = a.split()[0] if a.split() else ""
+    if first.endswith("node") or first == "node": return "node (other)"
+    return "other"
+
+
+def mem_groups():
+    rows = ps_rows()
+    top = {}
+    for line in sh("top -l 1 -o mem -n 1000 -stats pid,mem").splitlines():
+        p = line.split()
+        if len(p) == 2 and p[0].isdigit():
+            top[int(p[0])] = mb(p[1])
+    g = collections.defaultdict(lambda: [0, 0.0])
+    big = []
+    for pid, r in rows.items():
+        m = top.get(pid, 0.0)
+        k = kind_of(r["args"])
+        g[k][0] += 1; g[k][1] += m
+        big.append((m, pid, r))
+    return g, sorted(big, key=lambda x: -x[0])[:12]
+
+
+# ---------------------------------------------------------------- strays
+
+def listening():
+    out = sh("lsof -nP -iTCP -sTCP:LISTEN -Fpn")
+    res, pid = collections.defaultdict(set), None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            res[pid].add(line.rsplit(":", 1)[-1])
+    return res
+
+
+def axi_session(pid):
+    """chrome-devtools-axi session that owns a bridge pid (~/.chrome-devtools-axi/sessions/<name>/bridge.pid)."""
+    for f in glob.glob(os.path.expanduser("~/.chrome-devtools-axi/sessions/*/bridge.pid")):
+        try:
+            if json.load(open(f)).get("pid") == pid:
+                return os.path.basename(os.path.dirname(f))
+        except (OSError, ValueError):
+            pass
+    return "default"
+
+
+def clients(port):
+    return max(0, len(sh(f"lsof -nP -iTCP:{port} -sTCP:ESTABLISHED").splitlines()) - 1)
+
+
+def launchd_pids():
+    s = set()
+    for line in sh("launchctl list").splitlines()[1:]:
+        p = line.split()
+        if p and p[0].isdigit():
+            s.add(int(p[0]))
+    return s
+
+
+def live_quiet():
+    f = os.path.join(HOME, ".cache/siso-heavy/live-quiet.pids")
+    try:
+        pids = [int(x) for x in open(f).read().split()]
+    except Exception:
+        return []
+    return [p for p in pids if subprocess.run(["kill", "-0", str(p)], capture_output=True).returncode == 0]
+
+
+def keep_patterns():
+    try:
+        lines = open(os.path.join(HOUSE, "keep.txt")).read().splitlines()
+    except OSError:
+        return []
+    return [re.compile(l.split(" #")[0].strip()) for l in lines if l.strip() and not l.lstrip().startswith("#")]
+
+
+def find_strays():
+    rows, lps, listen = ps_rows(), launchd_pids(), listening()
+    keep = keep_patterns()
+    rows = {p: r for p, r in rows.items() if not any(k.search(r["args"]) for k in keep)}
+    found = []  # (category, pid, why, fix)
+    # 1. console-wait waiters: dead session (ppid 1) or duplicates for one session (keep the newest)
+    waiters = [(p, r) for p, r in rows.items() if "console/bin/console-wait" in r["args"]]
+    by_parent = collections.defaultdict(list)
+    for p, r in waiters:
+        if r["ppid"] == 1:
+            found.append(("waiters", p, f"console-wait for a session that has ended (up {r['age']/3600:.1f}h, polls every 2 s)", f"kill {p}"))
+        else:
+            by_parent[r["ppid"]].append((r["age"], p))
+    for parent, lst in by_parent.items():
+        for age, p in sorted(lst)[1:]:
+            found.append(("waiters", p, f"duplicate console-wait for Claude {parent} (up {age/3600:.1f}h; the newest one stays)", f"kill {p}"))
+    # 2. dev/file servers whose starter is gone, not a launchd service, nobody connected, older than 2 h
+    for p, ports in listen.items():
+        r = rows.get(p)
+        if not r or not re.search(r"\bvite\b|next dev|http\.server|serve\.mjs|webpack|astro dev|storybook", r["args"]):
+            continue
+        cwd = sh(f"lsof -a -p {p} -d cwd -Fn").partition("\nn")[2].strip()
+        if any(k.search(cwd) for k in keep):  # a bare `node serve.mjs` is only identifiable by its folder
+            continue
+        if r["ppid"] == 1 and p not in lps and r["age"] > 7200 and all(clients(pt) == 0 for pt in ports):
+            found.append(("servers", p, f"{','.join(sorted(ports))}: starter gone, no clients, up {r['age']/3600:.1f}h: {short(r['args'], 70)}", f"kill {p}"))
+    # 3. Chrome: the user app open with no windows; automation browsers whose owner is gone
+    for p, r in rows.items():
+        a = r["args"]
+        if not re.search(r"MacOS/Google Chrome( |$)", a) or "--type=" in a:
+            continue
+        if a.strip().endswith("MacOS/Google Chrome") and r["age"] > 3600:
+            w = sh(["osascript", "-e", 'tell application "Google Chrome" to count windows']).strip()
+            if w == "0":
+                found.append(("chrome", p, f"your Chrome, open {r['age']/3600:.1f}h with 0 windows", f"kill -TERM {p}"))
+        elif r["ppid"] == 1 and re.search(r"--disable-field-trial-config|--headless|--remote-debugging|--app=", a) and r["age"] > 600:
+            found.append(("chrome", p, f"agent-launched Chrome whose owner is gone, up {r['age']/60:.0f} min: {short(a.split('--')[0] + ' ' + (re.search(r'--app=\S+', a).group(0) if '--app=' in a else ''), 90)}", f"kill -TERM {p}"))
+    # 4. chrome-devtools-axi bridge idle
+    for p, r in rows.items():
+        if "chrome-devtools-axi-bridge" in r["args"] and r["age"] > 3600:
+            if all(clients(pt) == 0 for pt in listen.get(p, {"9224"})):
+                found.append(("axi", p, f"chrome-devtools-axi headless browser idle, up {r['age']/3600:.1f}h (restarts itself on next use)", f"CHROME_DEVTOOLS_AXI_SESSION={axi_session(p)} chrome-devtools-axi stop"))
+    # 5. orphaned Claude Bash loops (sleep polls) older than 1 h
+    for p, r in rows.items():
+        if r["ppid"] == 1 and "shell-snapshots/snapshot" in r["args"] and r["age"] > 3600:
+            kids = [c for c, cr in rows.items() if cr["ppid"] == p]
+            if any("sleep" in rows[c]["args"] for c in kids):
+                loop = re.search(r"eval '(.{0,90})", r["args"])
+                found.append(("loops", p, f"polling loop from an ended Claude session, up {r['age']/3600:.1f}h: {short(loop.group(1) if loop else r['args'], 90)}", f"kill {p}"))
+    # 6. eslogger left by a killed `churn` run: root, orphaned, writing every fork/exec to a deleted file
+    for p, r in rows.items():
+        if r["ppid"] == 1 and r["args"].startswith("/usr/bin/eslogger exec fork") and r["age"] > 300:
+            found.append(("monitors", p, f"eslogger from an interrupted `laptop-health churn`, up {r['age']/60:.0f} min", f"sudo kill {p}"))
+    return found
+
+
+# ---------------------------------------------------------------- owners: which agent (herdr pane) a process belongs to
+
+AGENT_RX = re.compile(r"(^|/)claude( |$)|/claude/versions/|/\.local/bin/omp( |$)|(^|/)omp( |$)|(^|/)codex( |$)|/codex/codex")
+CACHE = os.path.join(HOME, ".cache/laptop-health")
+
+
+def agent_ancestor(pid, rows):
+    """The nearest Claude/omp/codex CLI above pid (or pid itself), else None."""
+    cur = pid
+    for _ in range(40):
+        r = rows.get(cur)
+        if not r:
+            return None
+        if AGENT_RX.search(r["args"]) and "codex-router" not in r["args"]:
+            return cur
+        if r["ppid"] in (0, 1) or r["ppid"] == cur:
+            return None
+        cur = r["ppid"]
+    return None
+
+
+def herdr_json(*args):
+    try:
+        return json.loads(sh(["herdr", *args], timeout=10) or "{}").get("result", {})
+    except (ValueError, AttributeError):
+        return {}
+
+
+_names = None
+
+
+def herdr_names():
+    """pane_id -> name (herdr agent list) or label."""
+    global _names
+    if _names is None:
+        _names = {}
+        for a in herdr_json("agent", "list").get("agents", []) + herdr_json("pane", "list").get("panes", []):
+            n = a.get("label") or a.get("name") or a.get("terminal_title_stripped")   # herdr 0.9: a label (pane rename) wins over the title
+            if n and (a.get("label") or a["pane_id"] not in _names):
+                _names[a["pane_id"]] = n
+    return _names
+
+
+_panes = {}
+
+
+def agent_info(apid, rows):
+    """{pid, kind, pane, tab, name, cwd, tty} for an agent CLI process."""
+    if apid in _panes:
+        return _panes[apid]
+    a = rows.get(apid, {}).get("args", "")
+    kind = "omp" if "omp" in a.split()[0] else "codex" if "codex" in a.split()[0] else "claude"
+    env = sh(["ps", "eww", "-o", "command=", "-p", str(apid)])
+    m = re.search(r"\bHERDR_PANE_ID=(\S+)", env)
+    info = {"pid": apid, "kind": kind, "pane": None, "tab": None, "name": None, "cwd": None,
+            "tty": sh(["ps", "-o", "tty=", "-p", str(apid)]).strip()}
+    if m:
+        p = herdr_json("pane", "get", m.group(1)).get("pane", {})
+        info.update(pane=p.get("pane_id") or m.group(1), tab=p.get("tab_id"), cwd=p.get("cwd"))
+        info["name"] = herdr_names().get(info["pane"])
+    if not info["cwd"]:
+        info["cwd"] = sh(f"lsof -a -p {apid} -d cwd -Fn").partition("\nn")[2].strip() or None
+    _panes[apid] = info
+    return info
+
+
+def agent_label(i):
+    where = f"herdr pane {i['pane']}" + (f" ({i['name']})" if i.get("name") else "") if i.get("pane") else f"terminal {i['tty']} (not in herdr)"
+    return f"{i['kind']} {i['pid']} in {where}, cwd {short(i.get('cwd') or '?', 60)}"
+
+
+def load_tips():
+    try:
+        return json.load(open(os.path.join(HOUSE, "tips.json")))
+    except (OSError, ValueError):
+        return []
+
+
+def tips_for(args, tips):
+    return [t for t in tips if re.search(t["match"], args)]
+
+
+def input_box(pane):
+    """Text in a Claude pane's input box ('' = empty), or None when the box is not visible (don't type then)."""
+    lines = sh(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "60"], timeout=10).splitlines()
+    idx = [i for i, l in enumerate(lines) if l.lstrip().startswith("❯")]
+    if not idx:
+        return None
+    i = idx[-1]
+    text = [lines[i].lstrip()[1:].replace("\xa0", " ").strip()]
+    for l in lines[i + 1:]:
+        if l.strip().startswith("─"):
+            break
+        text.append(l.strip())
+    return " ".join(t for t in text if t)
+
+
+def tell(target, msg, dry=False):
+    """Type one line into an agent's herdr pane, only if its input box is empty. Returns (ok, why)."""
+    pane = target
+    if not re.match(r"^(w[0-9a-f]+(-\d+|:p\w+)|p_\d+)$", target):          # herdr 0.9 ids: w65bb...:p2S
+        hits = [p for p, n in herdr_names().items() if n.lower() == target.lower()]
+        if len(hits) != 1:
+            return False, f"no single herdr pane named {target!r}"
+        pane = hits[0]
+    box = input_box(pane)
+    if box is None:
+        return False, f"{pane}: input box not visible, not typing"
+    if box:
+        return False, f"{pane}: input box has text ({box[:40]!r}), someone may be typing; not sending"
+    line = "From LAPTOP-HEALTH: " + " ".join(msg.split())
+    if dry:
+        return True, f"would send to {pane}: {line}"
+    sh(["herdr", "pane", "send-text", pane, line], timeout=10)
+    sh(["herdr", "pane", "send-keys", pane, "Enter"], timeout=10)
+    time.sleep(1.5)
+    seen = line[:40] in " ".join(sh(["herdr", "pane", "read", pane, "--source", "recent", "--lines", "80"], timeout=10).split())
+    return seen, f"sent to {pane}" + ("" if seen else " (not seen in the pane afterwards; check it)")
+
+
+def hogs(dur):
+    """Sample the load for dur s and group it by owning agent pane; non-agent load by kind. Runs as the user."""
+    run, samples, tot = sample_run(dur)
+    rows, tips = ps_rows(), load_tips()
+    groups = {}
+    for p, n in run.items():
+        if p not in rows:
+            key = ("gone", None)
+        else:
+            a = agent_ancestor(p, rows)
+            key = ("agent", a) if a else ("kind", kind_of(rows[p]["args"]))
+        g = groups.setdefault(key, {"threads": 0.0, "procs": collections.Counter(), "tips": {}})
+        g["threads"] += n / samples
+        if p in rows:
+            g["procs"][p] += n / samples
+            if key[0] == "agent" and p != key[1]:
+                chain, cur = [], p  # the process and its shells up to the agent: a loop's args live in the shell
+                while cur in rows and cur != key[1] and len(chain) < 10:
+                    chain.append(rows[cur]["args"]); cur = rows[cur]["ppid"]
+                for t in tips_for(" \n ".join(chain), tips):
+                    g["tips"].setdefault(t["id"], (t, p))
+    return groups, rows, samples, (sum(tot) / samples if samples else 0)
+
+
+def tell_waste(i, g):
+    """One message per agent pane naming every waste found in its tree; each tip at most once an hour per pane."""
+    new = [(t, p) for t, p in g["tips"].values() if not told_recently(i["pane"], t["id"])]
+    if not new:
+        return None
+    parts = [f"your {t['what']} (pid {p})" for t, p in new]
+    tips = " ".join(f"({n}) {t['tip']}" for n, (t, _) in enumerate(new, 1))
+    # A0, 3 Oct ~17:30 (Shaan: agents "just getting pinged ... a waste of tokens"): a tip that says "no need to stop what's
+    # running" is not worth waking an agent's whole context for. Tips are logged; LAPTOP_HEALTH_TELL=1 types them again.
+    if os.environ.get("LAPTOP_HEALTH_TELL") != "1":
+        try:
+            os.makedirs(os.path.expanduser("~/.local/state/laptop-health"), exist_ok=True)
+            with open(os.path.expanduser("~/.local/state/laptop-health/tips.jsonl"), "a") as f:
+                f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "pane": i["pane"], "tips": [t["id"] for t, _ in new], "parts": parts}) + "\n")
+        except OSError:
+            pass
+        for t, _ in new:
+            mark_told(i["pane"], t["id"])
+        return {"pane": i["pane"], "tips": [t["id"] for t, _ in new], "ok": True, "why": "logged (not typed)"}
+    ok, why = tell(i["pane"], f"{'; '.join(parts)} {'is' if len(new) == 1 else 'are'} keeping {g['threads']:.1f} of 8 cores busy "
+                   f"on the laptop. Tip{'s' if len(new) > 1 else ''}: {tips} No need to stop what's running; use this from the next run.")
+    if ok:
+        for t, _ in new:
+            mark_told(i["pane"], t["id"])
+    return {"pane": i["pane"], "tips": [t["id"] for t, _ in new], "ok": ok, "why": why}
+
+
+def dev_servers():
+    """Listening dev/file servers: [(pid, ports, mem_mb, age_s, clients, cwd, owner label or None)]."""
+    rows, listen = ps_rows(), listening()
+    memmb = {}
+    for line in sh("top -l 1 -o mem -n 1000 -stats pid,mem").splitlines():
+        p = line.split()
+        if len(p) == 2 and p[0].isdigit():
+            memmb[int(p[0])] = mb(p[1])
+    out = []
+    for p, ports in listen.items():
+        r = rows.get(p)
+        if not r or not re.search(r"\bvite\b|next dev|http\.server|serve\.mjs|webpack|astro dev|storybook", r["args"]):
+            continue
+        a = agent_ancestor(p, rows)
+        cwd = sh(f"lsof -a -p {p} -d cwd -Fn").partition("\nn")[2].strip()
+        out.append((p, sorted(ports), memmb.get(p, 0), r["age"], sum(clients(pt) for pt in ports), cwd,
+                    agent_label(agent_info(a, rows)) if a else None))
+    return sorted(out, key=lambda x: -x[2])
+
+
+def cmd_servers(argv):
+    s = dev_servers()
+    print(f"{len(s)} dev/file servers, {sum(x[2] for x in s)/1024:.1f} GB:\n")
+    for p, ports, m, age, cl, cwd, who in s:
+        print(f"  {m:5.0f} MB  :{','.join(ports):<6} up {age/3600:4.1f}h  clients {cl}  {short(cwd, 70)}\n{'':12}"
+              + (who or "starter gone (orphan); `strays` stops it after 2 h with no clients"))
+    return 0
+
+
+def cmd_hogs(argv):
+    dur = float(argv[0]) if argv and argv[0].replace(".", "").isdigit() else 15
+    send = "--tell" in argv
+    groups, rows, samples, avg = hogs(dur)
+    print(f"{samples} samples over {dur:.0f}s: your processes kept {avg:.1f} threads busy on average ({NCPU} cores)."
+          f" By owner (agent pane, or kind when no agent started it):\n")
+    for (k, key), g in sorted(groups.items(), key=lambda kv: -kv[1]["threads"])[:10]:
+        if g["threads"] < 0.05:
+            continue
+        if k == "agent":
+            i = agent_info(key, rows)
+            print(f"  {g['threads']:5.2f} threads  {agent_label(i)}")
+        else:
+            print(f"  {g['threads']:5.2f} threads  {key or 'short-lived (already gone)'}")
+        for p, n in g["procs"].most_common(3):
+            if n >= 0.05:
+                print(f"{'':20}{n:4.2f}  {p:<6} {short(rows[p]['args'], 80)}")
+        for t, p in g["tips"].values():
+            print(f"{'':20}waste: {t['what']}\n{'':20}tip:   {t['tip'][:160]}")
+        if g["tips"] and k == "agent" and g["threads"] >= 1.0:
+            i = agent_info(key, rows)
+            if not i.get("pane"):
+                print(f"{'':20}(not in herdr: tell Shaan which terminal, {i['tty']})")
+            elif send:
+                r = tell_waste(i, g)
+                print(f"{'':20}told: {r['why']}" if r else f"{'':20}(told this pane about these in the last hour)")
+    if not send:
+        print("\nadd --tell to message the agents behind the waste (only when their input box is empty, once an hour per tip)")
+    return 0
+
+
+def told_recently(pane, tip_id, within=3600):
+    try:
+        d = json.load(open(os.path.join(CACHE, "told.json")))
+    except (OSError, ValueError):
+        return False
+    return time.time() - d.get(f"{pane}|{tip_id}", 0) < within
+
+
+def mark_told(pane, tip_id):
+    os.makedirs(CACHE, exist_ok=True)
+    f = os.path.join(CACHE, "told.json")
+    try:
+        d = json.load(open(f))
+    except (OSError, ValueError):
+        d = {}
+    d[f"{pane}|{tip_id}"] = time.time()
+    json.dump(d, open(f, "w"))
+
+
+def cmd_who(argv):
+    if not argv or not argv[0].isdigit():
+        print("usage: laptop-health who <pid>"); return 2
+    rows, pid = ps_rows(), int(argv[0])
+    if pid not in rows:
+        print(f"{pid}: not running"); return 1
+    cur, chain = pid, []
+    while cur in rows and len(chain) < 12:
+        chain.append(cur)
+        if rows[cur]["ppid"] in (0, 1):
+            break
+        cur = rows[cur]["ppid"]
+    for p in chain:
+        print(f"  {p:<6} up {rows[p]['age']/60:6.1f} min  {short(rows[p]['args'], 110)}")
+    a = agent_ancestor(pid, rows)
+    if a:
+        print(f"\nowner: {agent_label(agent_info(a, rows))}")
+    else:
+        lab = next((l.split()[-1] for l in sh("launchctl list").splitlines() if l.split()[:1] == [str(chain[-1])]), None)
+        print(f"\nowner: no agent; top of the chain is {chain[-1]}" + (f" (launchd {lab})" if lab else ""))
+    for t in tips_for(" \n ".join(rows[p]["args"] for p in chain), load_tips()):
+        print(f"waste: {t['what']}\ntip:   {t['tip']}")
+    return 0
+
+
+def cmd_tell(argv):
+    if len(argv) < 2:
+        print('usage: laptop-health tell <pane id|herdr name> "<message>" [--dry]'); return 2
+    dry = "--dry" in argv
+    argv = [a for a in argv if a != "--dry"]
+    ok, why = tell(argv[0], " ".join(argv[1:]), dry=dry)
+    print(why)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- unheavy: builds and tests that skipped the `heavy` queue
+
+# A0, 2 Oct 15:40: "anything build/test-like on the laptop that isn't under 'heavy' gets flagged to its owner, and record it
+# as an issue ... protect ffmpeg's CPU". Each pass: find them, drop them to background QoS (the soak's ffmpeg keeps the
+# cores), tell the owning agent at most every 30 min, and keep one open issue per owner per day in .agents/issues.jsonl.
+BUILD_RX = re.compile(
+    r"(^|/)(tsc|vitest|jest|xcodebuild|swiftc|webpack|turbo|eslint)( |$)"
+    r"|(^|/)cargo (build|test|check|clippy|run|nextest|bench|doc)\b"
+    r"|(^|/)(vite(\.js)?|next|astro) build\b|(^|/)playwright test\b"
+    r"|(^|/)(pnpm|npm|yarn|bun)( \S+)*? (run )?(build|test|check|lint|typecheck|tsc)( |$)"
+    r"|(^|/)git( \S+)*? log\b.* -[SG]")
+HEAVY_RX = re.compile(r"(^|/)(heavy|tsc-inc|shot) ")
+UNHEAVY_MIN_AGE, UNHEAVY_TELL_EVERY = 30, 1800
+ISSUES = os.path.join(HOUSE, ".agents/issues.jsonl")
+
+
+def heavy_pids():
+    """Pids that hold a `heavy` slot right now (the job itself: heavy execs it)."""
+    out = set()
+    for f in glob.glob(os.path.join(HOME, ".cache/siso-heavy/slots/slot-*.info")):
+        m = re.match(r"pid (\d+)", open(f).read())
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+
+def unheavy(rows=None):
+    """[(pid, args, age, agent pid or None)]: the top build/test process of each tree with no heavy slot above it."""
+    rows, held = rows or ps_rows(), heavy_pids()
+    held |= {p for p, r in rows.items() if HEAVY_RX.search(r["args"])}  # queued or running under the heavy wrapper itself
+    out = []
+    for p, r in rows.items():
+        if r["age"] < UNHEAVY_MIN_AGE or not BUILD_RX.search(r["args"]) or "rust-analyzer" in r["args"]:
+            continue
+        cur, top, covered = r["ppid"], True, p in held
+        for _ in range(40):
+            if cur not in rows or cur in (0, 1) or covered:
+                break
+            covered = cur in held
+            if BUILD_RX.search(rows[cur]["args"]):
+                top = False                          # its parent is the build; report the parent once
+            cur = rows[cur]["ppid"]
+        if top and not covered:
+            out.append((p, r["args"], r["age"], agent_ancestor(p, rows)))
+    return out
+
+
+def tree(pid, rows):
+    kids = {}
+    for p, r in rows.items():
+        kids.setdefault(r["ppid"], []).append(p)
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop(); out.append(p); todo += kids.get(p, [])
+    return out
+
+
+def record_unheavy_issue(owner, pid, args, now):
+    """One open issue per owner per day; later sightings bump `seen` and keep the last 5 examples."""
+    try:
+        issues = [json.loads(l) for l in open(ISSUES) if l.strip()]
+    except OSError:
+        issues = []
+    day = now[:10]
+    hit = next((i for i in issues if i.get("kind") == "unheavy" and i.get("owner") == owner and i.get("opened", "")[:10] == day
+                and i.get("status") == "open"), None)
+    ex = {"at": now, "pid": pid, "cmd": safe_text(short(args, 160))}
+    if hit:
+        if not any(e["pid"] == pid for e in hit["examples"]):
+            hit["seen"] += 1; hit["examples"] = (hit["examples"] + [ex])[-5:]
+    else:
+        n = max([int(i["id"][2:]) for i in issues if re.match(r"H-\d+$", i.get("id", ""))] + [0]) + 1
+        issues.append({"id": f"H-{n:04d}", "machine": "laptop", "kind": "unheavy", "owner": owner, "opened": now, "status": "open",
+                       "what": "build/test on the laptop outside `heavy` (rule: heavy -- <cmd>, Agent Base lanes on the mini)",
+                       "action": "throttled to background QoS; owner told", "seen": 1, "examples": [ex]})
+    tmp = ISSUES + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in issues))
+    os.replace(tmp, ISSUES)
+
+
+def safe_text(s):
+    s = re.sub(r"(://[^/\s:@]+:)[^@\s]+@", r"\1***@", s)  # postgres://user:PASSWORD@host
+    return re.sub(r"(--token[= ]|token=|key=|secret=|password=|Bearer )\S+", r"\1***", s)
+
+
+def cmd_unheavy(argv):
+    """List build/test processes outside `heavy`. --enforce: background-QoS them, tell the owner, record the issue."""
+    enforce, rows = "--enforce" in argv, ps_rows()
+    found = unheavy(rows)
+    now = datetime.datetime.now().astimezone().isoformat(timespec="minutes")
+    for pid, args, age, apid in found:
+        # an agent's Bash shell carries the command in its args; name the build itself, not the zsh around it
+        args = next((rows[q]["args"] for q in tree(pid, rows) if BUILD_RX.search(rows[q]["args"])
+                     and not re.match(r"\S*/?(zsh|bash|sh) -c ", rows[q]["args"])), args)
+        i = agent_info(apid, rows) if apid else None
+        owner = (i.get("name") or i.get("pane") or f"{i['kind']} {apid}") if i else "no agent"
+        print(f"{pid:>6}  {age / 60:>5.1f} min  {owner:<18} {safe_text(short(args, 110))}")
+        if not enforce:
+            continue
+        for p in tree(pid, rows):           # background QoS: CPU and disk go to everything else first (ffmpeg, the UI)
+            subprocess.run(["taskpolicy", "-b", "-p", str(p)], capture_output=True)
+        record_unheavy_issue(owner, pid, args, now)
+        if i and i.get("pane") and not told_recently(i["pane"], "unheavy", UNHEAVY_TELL_EVERY):
+            ok, why = tell(i["pane"], f"HEALTH: your {short(args.split(' -')[0], 70)} (pid {pid}) runs on the laptop outside heavy "
+                           f"while the laptop is at load {loadavg()[0]:.0f} on {NCPU} cores. I set it to background priority (it keeps "
+                           f"running). Rule: wrap builds/tests/history searches in 'heavy -- <cmd>', and Agent Base lanes build on the "
+                           f"mini (ssh tab). Logged in laptop-health/.agents/issues.jsonl.")
+            if ok:
+                mark_told(i["pane"], "unheavy")
+            print(f"{'':8}told: {why}")
+    if not found:
+        print("none: every build/test on the laptop is under heavy")
+    return 0
+
+
+# ---------------------------------------------------------------- ramguard: free memory before the laptop thrashes
+
+# A0, 2 Oct 17:55, after load 172-210 from RAM exhaustion (99 MB free, swap 6.5 GB): when available memory < 1.5 GB or swap
+# > 5 GB for 2 passes, (1) stop idle headless Chrome bridges older than 10 min, (2) park agents that have been done/idle
+# > 60 min (a clean /exit; the session resumes later), (3) page A0's inbox once per incident. Dry-run until
+# ~/.cache/health-watch/ram-guard.on exists. Never: the soak, Agent Zero, A0-DESK, anything mid-task, anything in ram-guard-keep.txt.
+RAM_MIN_MB, SWAP_MAX_MB, IDLE_MIN, CHROME_MIN, PARK_PER_PASS = 1500, 5120, 60, 10, 3
+GUARD_STATE = os.path.join(HOME, ".cache/health-watch/ram-guard.json")
+GUARD_ON = os.path.join(HOME, ".cache/health-watch/ram-guard.on")
+PARKED_LOG = os.path.join(HOME, ".cache/health-watch/parked.jsonl")
+A0_INBOX = os.path.join(HOME, "SISO_Workspace/SISO_Agents/agent-zero/siso-firstmate/.agents/a0/inbox.log")
+
+
+def available_mb():
+    """free + inactive + speculative + purgeable pages: what the kernel can hand out without paging."""
+    vm = sh("vm_stat")
+    page = int((re.search(r"page size of (\d+)", vm) or [0, 16384])[1])
+    n = sum(int(m.group(1)) for k in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable")
+            for m in [re.search(k + r":\s+(\d+)", vm)] if m)
+    return n * page // 1048576
+
+
+def guard_keep():
+    try:
+        lines = open(os.path.join(HOUSE, "ram-guard-keep.txt")).read().splitlines()
+    except OSError:
+        return []
+    return [re.compile(l.split(" #")[0].strip(), re.I) for l in lines if l.strip() and not l.lstrip().startswith("#")]
+
+
+def registry_kept():
+    """Names Agent Base's registry marks as owner or pinned (so a new owner is covered without editing the keep file)."""
+    try:
+        d = json.load(open(os.path.join(HOME, ".local/state/agent-base/registry.json")))
+    except (OSError, ValueError):
+        return set()
+    names = {k for k, v in d.get("agents", {}).items() if isinstance(v, dict) and v.get("kind") == "owner"} | set(d.get("pinned") or [])
+    return {n.lower() for n in names}
+
+
+def landed(cwd):
+    """A worktree whose work is landed: HEAD is in origin/main, nothing uncommitted, no process running inside it."""
+    g = lambda *x: subprocess.run(["git", "-C", cwd, *x], capture_output=True, text=True)
+    if not cwd or g("rev-parse", "--git-dir").returncode:
+        return False
+    return (g("merge-base", "--is-ancestor", "HEAD", "origin/main").returncode == 0 and not g("status", "--porcelain").stdout.strip()
+            and not any(cwd + "/" in r["args"] for q, r in ps_rows().items() if q != os.getpid() and "ps -Ao" not in r["args"]))
+
+
+def session_file(kind, sid):
+    pats = {"claude": [f"~/.config/claude-*/projects/*/{sid}.jsonl", f"~/.claude*/projects/*/{sid}.jsonl"],
+            "codex": [f"~/.codex/sessions/*/*/*/rollout-*{sid}.jsonl"]}.get(kind, [])
+    for pat in pats:
+        hits = glob.glob(os.path.expanduser(pat))
+        if hits:
+            return max(hits, key=os.path.getmtime)
+    return None
+
+
+def agent_idle_min(a):
+    """Minutes since the agent's session file was last written (its last turn); None when it cannot be found."""
+    sess = a.get("agent_session") or {}
+    f = session_file(a.get("agent"), sess.get("value", ""))
+    return (time.time() - os.path.getmtime(f)) / 60 if f else None
+
+
+def park_candidates(names=None):
+    """[(pane, name, kind, sid, cwd, idle_min)] done/idle > IDLE_MIN, not kept; [(...,why)] for those skipped."""
+    keep, names, owners = guard_keep(), names or herdr_names(), registry_kept()
+    ok, skipped = [], []
+    for a in herdr_json("agent", "list").get("agents", []):
+        if a.get("agent_status") not in ("done", "idle"):
+            continue
+        pane, cwd = a["pane_id"], a.get("cwd") or ""
+        name = names.get(pane) or a.get("terminal_title_stripped") or pane
+        row = (pane, name, a.get("agent"), (a.get("agent_session") or {}).get("value"), cwd)
+        text = f"{name} {a.get('terminal_title_stripped', '')} {cwd}"
+        idle = agent_idle_min(a)
+        if any(k.search(text) for k in keep):
+            skipped.append(row + (idle, "kept: ram-guard-keep.txt"))
+        elif name.lower() in owners or (a.get("terminal_title_stripped") or "").lower() in owners:
+            skipped.append(row + (idle, "kept: owner/pinned in the Agent Base registry"))
+        elif a.get("focused"):
+            skipped.append(row + (idle, "kept: Shaan has it focused"))
+        elif idle is None:
+            skipped.append(row + (None, "kept: no session file, idle time unknown"))
+        elif idle < IDLE_MIN:
+            skipped.append(row + (idle, f"kept: idle only {idle:.0f} min"))
+        elif not row[3]:
+            skipped.append(row + (idle, "kept: no session id to resume"))
+        elif a.get("agent") == "codex" and not landed(cwd):  # A0: a finished codex lane closes only when its work is landed
+            skipped.append(row + (idle, "kept: codex lane, work not landed (unmerged, uncommitted or busy)"))
+        else:
+            ok.append(row + (idle,))
+    return sorted(ok, key=lambda r: -r[5]), skipped
+
+
+def chrome_candidates(rows=None):
+    """Headless Chrome (chrome-devtools bridges) older than CHROME_MIN whose whole tree did no CPU in a 4 s window."""
+    rows = rows or ps_rows()
+    roots = [p for p, r in rows.items() if "Google Chrome.app/Contents/MacOS/Google Chrome" in r["args"]
+             and ("--headless" in r["args"] or "--disable-background-networking" in r["args"]) and r["age"] > CHROME_MIN * 60]
+    if not roots:
+        return []
+    t0 = {p: sum(rows[q]["cpu"] for q in tree(p, rows)) for p in roots}
+    time.sleep(4)
+    now = ps_rows()
+    out = []
+    for p in roots:
+        if p in now:
+            used = sum(now[q]["cpu"] for q in tree(p, now) if q in now) - t0[p]
+            if used < 0.3:
+                out.append((p, rows[p]["age"] // 60, round(used, 2)))
+    return out
+
+
+def stop_chrome(pid):
+    rows, cur = ps_rows(), pid
+    for _ in range(8):  # chrome -> chrome-devtools-mcp -> npm exec -> bridge (its own launchd-parented process)
+        cur = rows.get(cur, {}).get("ppid", 0)
+        if cur in (0, 1) or cur not in rows:
+            break
+        if "chrome-devtools-axi-bridge" in rows[cur]["args"]:
+            ses = axi_session(cur)
+            r = subprocess.run(["chrome-devtools-axi", "stop"], env=dict(os.environ, CHROME_DEVTOOLS_AXI_SESSION=ses), capture_output=True, timeout=20)
+            return f"axi session {ses} stopped" if r.returncode == 0 else f"axi stop failed rc={r.returncode}"
+    subprocess.run(["kill", "-TERM", str(pid)], capture_output=True)
+    return "TERM chrome root"
+
+
+def park(pane, kind, sid, cwd):
+    """Claude: a clean /exit typed into an idle, empty input box (session resumes with resume_cmd). If Claude answers with its
+    'Background work is running' menu, press Esc and leave the agent alone. Codex lanes (landed) are closed with herdr."""
+    cur = next((a for a in herdr_json("agent", "list").get("agents", []) if a["pane_id"] == pane), None)
+    if not cur or cur.get("agent_status") not in ("done", "idle"):
+        return False, "no longer idle"
+    if kind == "codex":
+        sh(["herdr", "pane", "close", pane], timeout=10)
+        return True, "closed (codex lane, landed)"
+    if input_box(pane) != "":
+        return False, "input box not empty"
+    sh(["herdr", "pane", "send-text", pane, "/exit"], timeout=10)
+    sh(["herdr", "pane", "send-keys", pane, "Enter"], timeout=10)
+    time.sleep(4)
+    if "background work is running" in sh(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "60"], timeout=10).lower():
+        sh(["herdr", "pane", "send-keys", pane, "Escape"], timeout=10)   # never pick an option
+        return False, "kept: background work"
+    time.sleep(2)
+    gone = not any(a["pane_id"] == pane for a in herdr_json("agent", "list").get("agents", []))
+    return gone, "parked" if gone else "still running after /exit"
+
+
+def resume_cmd(kind, sid, cwd):
+    return f"cd {cwd} && " + (f"claude --resume {sid}" if kind == "claude" else f"codex resume {sid}")
+
+
+def cmd_ramguard(argv):
+    """Memory guard. `ramguard` = one pass (acts only when ram-guard.on exists and memory is short); `--list` = dry-run list only."""
+    live = os.path.exists(GUARD_ON) and "--list" not in argv
+    free, sw = available_mb(), memory()["swap_used_mb"] or 0
+    short_now = free < RAM_MIN_MB or sw > SWAP_MAX_MB
+    try:
+        st = json.load(open(GUARD_STATE))
+    except (OSError, ValueError):
+        st = {}
+    st["short"] = st.get("short", 0) + 1 if short_now else 0
+    st["clean"] = 0 if short_now else st.get("clean", 0) + 1
+    chromes = chrome_candidates() if (short_now or "--list" in argv) else []
+    ok, skipped = park_candidates() if (short_now or "--list" in argv) else ([], [])
+    print(f"available {free} MB (limit {RAM_MIN_MB}), swap used {sw} MB (limit {SWAP_MAX_MB}): " + ("SHORT" if short_now else "ok")
+          + f"; guard {'ON' if live else 'dry-run'}; short for {st['short']} pass(es)")
+    for p, age, used in chromes:
+        print(f"  chrome  pid {p} up {age} min, tree cpu {used}s in 4 s  -> stop")
+    for pane, name, kind, sid, cwd, idle in ok:
+        print(f"  park    {pane:<12} {name[:34]:<34} {kind} idle {idle:.0f} min  -> {'close pane (landed)' if kind == 'codex' else '/exit; resume: ' + resume_cmd(kind, sid, short(cwd, 50))}")
+    for row in skipped:
+        print(f"  keep    {row[0]:<12} {row[1][:34]:<34} {row[2]} {row[6]}")
+    if live and st["short"] >= 2:                     # two passes in a row: not a blip
+        acted = []
+        for p, age, used in chromes:
+            acted.append(f"chrome {p}: {stop_chrome(p)}")
+        for pane, name, kind, sid, cwd, idle in ok[:PARK_PER_PASS]:
+            if time.time() - st.setdefault("bgwork", {}).get(pane, 0) < 3600:
+                continue
+            done, why = park(pane, kind, sid, cwd)
+            if why == "kept: background work":
+                st["bgwork"][pane] = time.time()
+            acted.append(f"{name}: {why}")
+            if done:
+                os.makedirs(os.path.dirname(PARKED_LOG), exist_ok=True)
+                with open(PARKED_LOG, "a") as f:
+                    f.write(json.dumps({"at": datetime.datetime.now().isoformat(timespec="seconds"), "name": name, "kind": kind,
+                                        "session": sid, "cwd": cwd, "resume": resume_cmd(kind, sid, cwd)}) + "\n")
+        if acted and not st.get("paged"):
+            st["paged"] = True
+            with open(A0_INBOX, "a") as f:
+                f.write(f"{datetime.datetime.now().strftime('%H:%M')} HEALTH RAM-GUARD: available {free} MB, swap {sw} MB; did: "
+                        + "; ".join(acted)[:900] + f". Parked sessions resume with the command in {PARKED_LOG}\n")
+            print("paged A0")
+        for a in acted:
+            print("  did:", a)
+    if st["clean"] >= 5:
+        st["paged"] = False
+    os.makedirs(os.path.dirname(GUARD_STATE), exist_ok=True)
+    json.dump(st, open(GUARD_STATE, "w"))
+    return 0
+
+
+# ---------------------------------------------------------------- disk
+
+DATA_VOL = "/System/Volumes/Data"  # `df /` is the read-only system snapshot and lies about use (memory: macos-disk-usage)
+DISK_WARN_GB, DISK_CRIT_GB = 25, 10  # 24 Sep: 137 MB free crashed herdr and every agent
+
+
+def free_gb():
+    st = os.statvfs(DATA_VOL)
+    return round(st.f_bavail * st.f_frsize / 1024 ** 3, 1), round(st.f_blocks * st.f_frsize / 1024 ** 3)
+
+
+def du_kb(path, timeout=600):
+    out = sh(["taskpolicy", "-b", "du", "-skx", path], timeout=timeout).split()
+    return int(out[0]) if out and out[0].isdigit() else 0
+
+
+def repo_mains():
+    """Main checkouts from the estate inventory, plus the ones that hold today's worktrees."""
+    mains = set()
+    try:
+        inv = json.load(open(os.path.join(HOME, "SISO_Workspace/SISO_Agents/siso-estate/machines/laptop/repos.json")))
+        mains |= {r["path"] for r in inv["repos"] if r["kind"] == "repo"}
+    except (OSError, ValueError, KeyError):
+        pass
+    for root in (os.path.join(HOME, "SISO_Workspace/_data/worktrees"), os.path.join(HOME, ".codex/worktrees")):
+        for g in glob.glob(root + "/*/*/.git") + glob.glob(root + "/*/.git"):
+            try:
+                line = open(g).read().strip()
+            except OSError:
+                continue
+            m = re.match(r"gitdir: (.*)/\.git/worktrees/", line)
+            if m:
+                mains.add(m.group(1))
+    return sorted(m for m in mains if os.path.isdir(m))
+
+
+def worktrees():
+    """[{path, main, branch}] for every linked worktree of every main checkout (git worktree list)."""
+    out = []
+    for main in repo_mains():
+        cur = {}
+        for line in sh(["git", "-C", main, "worktree", "list", "--porcelain"], timeout=20).splitlines() + [""]:
+            if line.startswith("worktree "):
+                cur = {"path": line[9:], "main": main, "branch": None}
+            elif line.startswith("branch "):
+                cur["branch"] = line[7:].replace("refs/heads/", "")
+            elif not line and cur:
+                # a real linked worktree has a .git FILE pointing back at this repo; stale entries can name whole
+                # repos (the ~/SISO_Workspace umbrella showed up as a "worktree" of isso-dashboard-ref)
+                g = os.path.join(cur["path"], ".git")
+                try:
+                    real = cur["path"] != main and os.path.isfile(g) and os.path.realpath(main) in os.path.realpath(open(g).read().split("gitdir:")[-1].strip())
+                except OSError:
+                    real = False
+                if real:
+                    out.append(cur)
+                cur = {}
+    seen, uniq = set(), []
+    for w in out:
+        if w["path"] not in seen:
+            seen.add(w["path"]); uniq.append(w)
+    return uniq
+
+
+def busy_dirs():
+    """Folders someone is in right now: every process cwd, and every herdr pane's cwd."""
+    d = set()
+    for line in sh("lsof -d cwd -Fn 2>/dev/null", timeout=30).splitlines():
+        if line.startswith("n/"):
+            d.add(line[1:])
+    for p in herdr_json("pane", "list").get("panes", []):
+        for k in ("cwd", "foreground_cwd"):
+            if p.get(k):
+                d.add(p[k])
+    return d
+
+
+def tree_facts(w, busy, measure=True):
+    p = w["path"]
+    gitdir = sh(["git", "-C", p, "rev-parse", "--absolute-git-dir"], timeout=10).strip()
+    idx = os.path.join(gitdir, "index")
+    touched = max((os.path.getmtime(f) for f in (idx, os.path.join(gitdir, "HEAD")) if os.path.exists(f)), default=0)
+    dirty = len(sh(["git", "-C", p, "status", "--porcelain", "-uno"], timeout=30).splitlines())
+    prof = sparse_profile(w["main"])  # slim = the profile's folders are really gone (core.sparseCheckout alone proves nothing:
+    # oracle-streaming has it set repo-wide with no pattern file, so every worktree was full)
+    sparse = bool(prof) and not any(os.path.isdir(os.path.join(p, x.strip("/"))) for x in prof["exclude"])
+    active = any(b == p or b.startswith(p + "/") for b in busy)
+    f = dict(w, idle_h=round((time.time() - touched) / 3600, 1) if touched else None, dirty=dirty, sparse=sparse, active=active)
+    if measure:
+        f["kb"] = du_kb(p)
+        f["slim_kb"] = 0 if sparse or not prof else sum(du_kb(os.path.join(p, x.strip("/"))) for x in prof["exclude"]
+                                                         if os.path.isdir(os.path.join(p, x.strip("/"))))
+    return f
+
+
+def sparse_profile(main):
+    try:
+        return json.load(open(os.path.join(HOUSE, "sparse.json"))).get(os.path.basename(main.rstrip("/")))
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_disk(argv):
+    sub = argv[0] if argv and not argv[0].startswith("-") else "summary"
+    rest = argv[1:] if argv and not argv[0].startswith("-") else argv
+    return {"summary": disk_summary, "scan": disk_scan, "trees": disk_trees, "slim": disk_slim,
+            "caches": disk_caches, "cargo": disk_cargo}.get(sub, lambda a: print(__doc__) or 2)(rest)
+
+
+def disk_summary(argv):
+    fg, tot = free_gb()
+    lvl = "CRITICAL" if fg < DISK_CRIT_GB else "low" if fg < DISK_WARN_GB else "ok"
+    print(f"disk: {fg} GB free of {tot} GB ({lvl}; herdr and every agent crashed at 0.1 GB on 24 Sep)")
+    try:  # trend from the watch log
+        pts = [json.loads(l) for l in open(os.path.join(CACHE, "watch.jsonl")) if '"free_gb"' in l]
+        if len(pts) >= 2:
+            a, b = pts[max(0, len(pts) - 13)], pts[-1]
+            print(f"trend: {a['free_gb']} GB at {a['at']} -> {b['free_gb']} GB at {b['at']} (watch log)")
+    except OSError:
+        pass
+    scans = sorted(glob.glob(os.path.join(CACHE, "du-*.tsv")))
+    if scans:
+        print(f"\nlast full scan {os.path.basename(scans[-1])[3:-4]} (`laptop-health disk scan` for a new one, ~10 min):")
+        rows = [l.split("\t") for l in open(scans[-1]).read().splitlines()]
+        for kb, path in sorted(((int(k), p) for k, p in rows if p.count("/") <= 5 and int(k) > 3 * 1048576), reverse=True)[:14]:
+            print(f"  {kb/1048576:6.1f} GB  {short(path, 90)}")
+    else:
+        print("\nno full scan yet: `laptop-health disk scan` (~10 min, background priority)")
+    print("\nnext: `laptop-health disk trees` (every worktree: size, idle, slimmable), `disk caches`")
+    return 0
+
+
+def disk_scan(argv):
+    """du -d 4 of home at background priority; saved and compared with the previous scan: what grew."""
+    os.makedirs(CACHE, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    out = os.path.join(CACHE, f"du-{stamp}.tsv")
+    prev = sorted(glob.glob(os.path.join(CACHE, "du-*.tsv")))
+    t0 = time.time()
+    with open(out, "w") as f:
+        subprocess.run(["taskpolicy", "-b", "du", "-k", "-d", "4", "-x", HOME], stdout=f, stderr=subprocess.DEVNULL)
+    print(f"scanned in {time.time()-t0:.0f}s -> {out}")
+    now = {p: int(k) for k, p in (l.split("\t") for l in open(out).read().splitlines())}
+    for kb, p in sorted(((k, p) for p, k in now.items() if p.count("/") <= 5 and k > 3 * 1048576), reverse=True)[:20]:
+        print(f"  {kb/1048576:6.1f} GB  {short(p, 90)}")
+    if prev:
+        old = {p: int(k) for k, p in (l.split("\t") for l in open(prev[-1]).read().splitlines())}
+        grew = sorted(((now[p] - old.get(p, 0), p) for p in now if p.count("/") <= 7), reverse=True)
+        print(f"\ngrew since {os.path.basename(prev[-1])[3:-4]}:")
+        for d, p in [g for g in grew if g[0] > 500 * 1024][:15]:
+            print(f"  +{d/1048576:5.1f} GB  {short(p, 90)}")
+    return 0
+
+
+def disk_trees(argv):
+    busy = busy_dirs()
+    ws = worktrees()
+    print(f"measuring {len(ws)} worktrees (du at background priority)...", file=sys.stderr)
+    facts = [tree_facts(w, busy) for w in ws]
+    os.makedirs(CACHE, exist_ok=True)
+    json.dump({"at": time.time(), "trees": facts}, open(os.path.join(CACHE, "trees.json"), "w"))
+    tot = sum(f["kb"] for f in facts); slim = sum(f["slim_kb"] for f in facts if not f["active"])
+    by_main = collections.Counter()
+    for f in facts:
+        by_main[os.path.basename(f["main"])] += f["kb"]
+    print(f"{len(facts)} worktrees, {tot/1048576:.1f} GB. By repo: " + ", ".join(f"{k} {v/1048576:.1f} GB" for k, v in by_main.most_common(6)))
+    print(f"slimming the idle ones with sparse.json frees ~{slim/1048576:.1f} GB (reversible): laptop-health disk slim --idle --run\n")
+    print(f"  {'GB':>5} {'idle h':>7} {'dirty':>5}  state     worktree (branch)")
+    for f in sorted(facts, key=lambda f: -f["kb"]):
+        st = "ACTIVE" if f["active"] else "slim" if f["sparse"] else "idle" if (f["idle_h"] or 0) > 6 else "recent"
+        extra = f"  slim -{f['slim_kb']/1048576:.1f} GB" if f["slim_kb"] > 100 * 1024 else ""
+        print(f"  {f['kb']/1048576:5.1f} {f['idle_h'] if f['idle_h'] is not None else '?':>7} {f['dirty']:>5}  {st:<8}  {short(f['path'], 70)} ({f['branch']}){extra}")
+    return 0
+
+
+def disk_slim(argv):
+    """Leave the sparse.json folders out of worktrees (git sparse-checkout, per worktree; `disable` restores them).
+    Only idle worktrees: nobody in them, untouched 6 h+, and nothing modified under the folders left out."""
+    run = "--run" in argv
+    targets = [a for a in argv if not a.startswith("--")]
+    busy = busy_dirs()
+    ws = worktrees()
+    if targets:
+        want = {os.path.realpath(t) for t in targets}
+        ws = [w for w in ws if os.path.realpath(w["path"]) in want]
+    elif "--idle" not in argv:
+        print("usage: laptop-health disk slim <worktree>... | --idle  [--run]"); return 2
+    freed = 0
+    for w in ws:
+        prof = sparse_profile(w["main"])
+        if not prof:
+            continue
+        f = tree_facts(w, busy, measure=False)
+        why = "someone is in it" if f["active"] else "already slim" if f["sparse"] else \
+              f"touched {f['idle_h']} h ago" if (f["idle_h"] or 0) < 6 and not targets else None
+        mod = sh(["git", "-C", w["path"], "status", "--porcelain", "--", *[x.strip("/") for x in prof["exclude"]]], timeout=30).strip()
+        if mod:
+            why = f"has changes under the slimmed folders ({len(mod.splitlines())})"
+        if why:
+            print(f"  skip  {short(w['path'], 80)}: {why}")
+            continue
+        kb = sum(du_kb(os.path.join(w["path"], x.strip("/"))) for x in prof["exclude"] if os.path.isdir(os.path.join(w["path"], x.strip("/"))))
+        if not run:
+            print(f"  would slim {short(w['path'], 80)}: -{kb/1048576:.2f} GB")
+            freed += kb; continue
+        pats = ["/*"] + ["!" + x for x in prof["exclude"]]
+        r = subprocess.run(["git", "-C", w["path"], "sparse-checkout", "set", "--no-cone", *pats], capture_output=True, text=True)
+        left = sum(du_kb(os.path.join(w["path"], x.strip("/"))) for x in prof["exclude"] if os.path.isdir(os.path.join(w["path"], x.strip("/"))))
+        ok = r.returncode == 0
+        freed += kb - left if ok else 0
+        print(f"  {'slimmed' if ok else 'FAILED '} {short(w['path'], 80)}: -{(kb-left)/1048576:.2f} GB {r.stderr.strip()[:120]}")
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, "slimmed.jsonl"), "a") as fh:
+            fh.write(json.dumps({"at": time.time(), "path": w["path"], "excluded": prof["exclude"], "kb": kb - left, "ok": ok,
+                                 "undo": f"git -C {w['path']} sparse-checkout disable"}) + "\n")
+    print(f"\n{'freed' if run else 'would free'} {freed/1048576:.1f} GB" + ("" if run else "  (add --run)")
+          + ("; undo one: git -C <worktree> sparse-checkout disable" if run else ""))
+    return 0
+
+
+CACHES = [  # (path, what, how to clean it safely)
+    ("~/Library/Caches/ms-playwright", "Playwright browsers (old versions pile up)", "npx playwright uninstall (old ones) or delete old chromium-* dirs"),
+    ("~/.npm/_cacache", "npm download cache", "npm cache clean --force"),
+    ("~/.yarn/berry/cache", "yarn berry cache", "yarn cache clean --all"),
+    ("~/Library/pnpm/store", "pnpm store", "pnpm store prune"),
+    ("~/.bun/install/cache", "bun cache", "bun pm cache rm"),
+    ("~/Library/Caches/Homebrew", "Homebrew downloads", "brew cleanup -s"),
+    ("~/Library/Developer/Xcode/DerivedData", "Xcode builds", "rm -rf (rebuilt on next build)"),
+    ("~/Library/Developer/CoreSimulator", "iOS simulators", "xcrun simctl delete unavailable"),
+    ("~/.cache/whisper", "whisper models", "rm (Groq is the path now)"),
+    ("~/.cache/huggingface", "Hugging Face models", "huggingface-cli delete-cache"),
+    ("~/Library/Containers/com.docker.docker", "Docker disk image", "docker system prune"),
+    ("~/.Trash", "Trash", "empty the Trash"),
+    ("~/.claude/projects", "Claude transcripts (history; not a cache)", "keep; archive old ones via the harness"),
+    ("~/.codex/worktrees", "Codex's own worktrees", "codex cleans them; `disk trees` shows idle ones"),
+]
+
+
+def disk_caches(argv):
+    print("regenerable caches and what cleans them (nothing is removed by this command):\n")
+    rows = []
+    for p, what, how in CACHES:
+        full = os.path.expanduser(p)
+        if os.path.exists(full):
+            rows.append((du_kb(full, timeout=300), p, what, how))
+    for kb, p, what, how in sorted(rows, reverse=True):
+        print(f"  {kb/1048576:6.1f} GB  {p:<42} {what}\n{'':12}clean: {how}")
+    return 0
+
+
+CARGO_STALE_H = 3  # 1 Oct: one Oracle worktree held 201 incremental dirs untouched 3 h+, 8.7 GB; removing them freed 6.3 GB
+
+
+def newest_mtime(path):
+    m = 0
+    for d, _, files in os.walk(path):
+        for x in [d] + [os.path.join(d, f) for f in files]:
+            try:
+                m = max(m, os.lstat(x).st_mtime)
+            except OSError:
+                pass
+    return m
+
+
+def stale_cargo(roots, stale_h=CARGO_STALE_H):
+    """[(kb, dir)]: cargo incremental folders (target/<profile>/incremental/<crate-hash>) nothing touched for stale_h
+    hours. Pure build cache: cargo rebuilds it when that configuration is built again, only slower that once."""
+    cut, out = time.time() - stale_h * 3600, []
+    for root in roots:
+        found = sh(["find", root, "-maxdepth", "5", "(", "-name", "node_modules", "-o", "-name", ".git", ")", "-prune",
+                    "-o", "-type", "d", "-name", "incremental", "-path", "*/target/*", "-print", "-prune"], timeout=60)
+        for inc in found.splitlines():
+            for d in sorted(glob.glob(os.path.join(inc, "*"))):
+                if os.path.isdir(d) and newest_mtime(d) < cut:
+                    out.append((du_kb(d, timeout=120), d))
+    return out
+
+
+def clear_stale_cargo(roots):
+    """Remove stale_cargo() folders while no rustc runs (checked before each one). Returns (kb freed, folders)."""
+    import shutil
+    kb = n = 0
+    for k, d in stale_cargo(roots):
+        if sh(["pgrep", "-x", "rustc"]).strip():
+            break
+        shutil.rmtree(d, ignore_errors=True)
+        if not os.path.exists(d):
+            kb, n = kb + k, n + 1
+    if n:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, "cargo-cleared.jsonl"), "a") as fh:
+            fh.write(json.dumps({"at": time.time(), "dirs": n, "kb": kb}) + "\n")
+    return kb, n
+
+
+def cargo_roots():
+    return sorted({w["path"] for w in worktrees()} | set(repo_mains()))
+
+
+def disk_cargo(argv):
+    """Stale cargo incremental caches in every repo and worktree; --run removes them (also done by watch under 25 GB)."""
+    if "--run" in argv:
+        if sh(["pgrep", "-x", "rustc"]).strip():
+            print("a rustc is running; try again when the build ends"); return 1
+        kb, n = clear_stale_cargo(cargo_roots())
+        print(f"removed {n} stale cargo incremental folders, {kb/1048576:.1f} GB"); return 0
+    rows = stale_cargo(cargo_roots())
+    by = collections.Counter()
+    for k, d in rows:
+        by[d.split("/target/")[0]] += k
+    for root, k in by.most_common(10):
+        print(f"  {k/1048576:6.1f} GB  {short(root, 90)}")
+    print(f"\n{len(rows)} folders untouched {CARGO_STALE_H} h+, {sum(k for k, _ in rows)/1048576:.1f} GB: laptop-health disk cargo --run")
+    return 0
+
+WATCH_LABEL = "com.siso.laptop-health-watch"
+
+
+def cmd_watch(argv):
+    """The persistent job. --once: one pass (what launchd runs every 10 min). --install / --uninstall the LaunchAgent."""
+    plist = os.path.join(HOME, "Library/LaunchAgents", WATCH_LABEL + ".plist")
+    if "--install" in argv:
+        os.makedirs(os.path.join(CACHE), exist_ok=True)
+        PY = "/opt/homebrew/bin/python3" if os.path.exists("/opt/homebrew/bin/python3") else sys.executable  # survives brew upgrades
+        path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.path.join(HOME, ".local/bin")
+        open(plist, "w").write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>{WATCH_LABEL}</string>
+ <key>ProgramArguments</key><array><string>{PY}</string><string>{os.path.realpath(__file__)}</string><string>watch</string><string>--once</string></array>
+ <key>StartInterval</key><integer>600</integer>
+ <key>RunAtLoad</key><true/>
+ <key>Nice</key><integer>10</integer>
+ <key>ProcessType</key><string>Background</string>
+ <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>
+ <key>StandardOutPath</key><string>{CACHE}/watch.log</string>
+ <key>StandardErrorPath</key><string>{CACHE}/watch.log</string>
+</dict></plist>
+""")
+        sh(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCH_LABEL}"])
+        sh(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist])
+        print(f"installed {plist}: one pass every 10 min, log {CACHE}/watch.jsonl")
+        return 0
+    if "--uninstall" in argv:
+        sh(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCH_LABEL}"])
+        if os.path.exists(plist):
+            os.remove(plist)
+        print("uninstalled"); return 0
+    if "--once" not in argv:
+        print("usage: laptop-health watch --once | --install | --uninstall\nlast passes:")
+        try:
+            for line in open(os.path.join(CACHE, "watch.jsonl")).readlines()[-6:]:
+                e = json.loads(line)
+                print(f"  {e['at']}  {e['level']:<8} load {e['load'][0]:.1f}  free {e['free_mb']} MB  "
+                      + f"starts {e.get('starts_per_min', '?')}/min  " + (f"told {len(e['told'])}  " if e["told"] else ""))
+                for h in e["hogs"][:3]:
+                    print(f"{'':16}{h['threads']:5.2f} threads  {h['who'][:100]}" + (f"  waste: {','.join(h['tips'])}" if h["tips"] else ""))
+                for pg in e.get("pings", [])[:3]:
+                    print(f"{'':16}{pg['per_min']:5d}/min  {pg['cmd'][:50]}  by {pg['who'][:60]}")
+        except OSError:
+            print("  none yet")
+        return 0
+    la, mem, pw = loadavg(), memory(), power()
+    groups, rows, samples, avg = hogs(10)
+    entry = {"at": datetime.datetime.now().strftime("%m-%d %H:%M"), "load": la, "free_mb": mem["free_mb"], "free_gb": free_gb()[0],
+             "compressor_mb": mem["compressor_mb"], "power": pw["source"], "lpm": pw["low_power_mode_now"], "hogs": [], "told": []}
+    entry["level"] = "critical" if pw["low_power_mode_now"] and la[0] > NCPU else "degraded" if la[0] > 2 * NCPU or (mem["free_mb"] or 999) < 300 else "ok"
+    for (k, key), g in sorted(groups.items(), key=lambda kv: -kv[1]["threads"])[:6]:
+        who = agent_label(agent_info(key, rows)) if k == "agent" else (key or "short-lived")
+        entry["hogs"].append({"threads": round(g["threads"], 2), "who": who, "tips": list(g["tips"])})
+        if k != "agent" or g["threads"] < 1.0:
+            continue
+        i = agent_info(key, rows)
+        if i.get("pane") and g["tips"]:
+            r = tell_waste(i, g)
+            if r:
+                entry["told"].append(r)
+    if have_sudo():
+        events, args, parent = capture_events(10)
+        # under launchd eslogger gets no events without Full Disk Access for the python it runs from: say so, not "0"
+        entry["starts_per_min"] = len(events) * 6 if events else None
+        entry["pings"] = [{"per_min": r, "cmd": k, "who": w} for r, k, w in pings(events, args, parent, 10, min_rate=60)[:5]]
+    strays = find_strays()
+    entry["strays"] = collections.Counter(c for c, *_ in strays)
+    for cat, pid, why, fix in strays:  # only our own leftovers are stopped unattended; `clean` is for the rest
+        if cat == "monitors":
+            subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)], capture_output=True)
+    if entry["free_gb"] < DISK_WARN_GB and not sh(["pgrep", "-x", "rustc"]).strip():
+        kb, n = clear_stale_cargo(cargo_roots())  # build cache only; nothing an agent wrote by hand
+        entry["cargo_cleared_mb"] = kb // 1024
+    os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "watch.jsonl"), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    print(json.dumps(entry))
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_check(argv):
+    as_json = "--json" in argv
+    pw, mem, la = power(), memory(), loadavg()
+    cap = capacity()
+    strays = find_strays()
+    g, _ = mem_groups()
+    agents = {k: g[k][0] for k in ("Claude sessions", "omp workers", "codex") if k in g}
+    lq = live_quiet()
+    heavy = sh("heavy --status").strip().splitlines()[:4] if sh("command -v heavy").strip() else []
+    causes = []
+    p = cap.get("clusters", {}).get("P") or next((v for k, v in cap.get("clusters", {}).items() if k.startswith("P")), None)
+    if pw["low_power_mode_now"]:
+        capped = f"; P-cores at {p['mhz']} of {p['max_mhz']} MHz" if p and p.get("max_mhz") else ""
+        causes.append(("critical", f"Low Power Mode is on ({pw['source']}{capped}). The Mac runs at a fraction of its speed, so load piles up.",
+                       "plug in the charger" if pw["source"] == "Battery" else "sudo pmset -a lowpowermode 0"))
+    elif p and p.get("max_mhz") and la[0] > NCPU and p["mhz"] < 0.5 * p["max_mhz"]:
+        causes.append(("critical", f"P-cores held at {p['mhz']} of {p['max_mhz']} MHz under load (thermal: {cap.get('thermal')}).", "check heat, charger wattage, Low Power Mode"))
+    if pw["source"] == "Battery" and (pw["percent"] or 100) <= 20:
+        causes.append(("critical", f"Battery {pw['percent']}% ({pw['remaining']} left).", "plug in the charger"))
+    if mem["free_mb"] is not None and mem["free_mb"] < 400 and (mem["compressor_mb"] or 0) > 3000:
+        topk = ", ".join(f"{k} {v[1]/1024:.1f} GB" for k, v in sorted(g.items(), key=lambda kv: -kv[1][1])[:3])
+        causes.append(("degraded", f"RAM is full: {mem['free_mb']} MB free, {mem['compressor_mb']/1024:.1f} GB compressed, swap {mem['swap_used_mb']} MB. Biggest: {topk}.", "laptop-health mem"))
+    if la[0] > 2 * NCPU:
+        causes.append(("degraded", f"Load {la[0]:.0f} on {NCPU} cores.", "laptop-health load  (then: laptop-health churn)"))
+    if agents.get("Claude sessions", 0) > 8:
+        causes.append(("degraded", f"{agents['Claude sessions']} Claude sessions open (about 300-400 MB each).", "close idle ones (herdr agent list)"))
+    groups, hrows, _, _ = hogs(3)
+    for (k, key), g in sorted(groups.items(), key=lambda kv: -kv[1]["threads"]):
+        if k == "agent" and g["tips"] and g["threads"] >= 1.0:
+            i = agent_info(key, hrows)
+            causes.append(("degraded", f"{agent_label(i)} keeps {g['threads']:.1f} cores busy with avoidable work: "
+                           + "; ".join(t["what"] for t, _ in g["tips"].values()) + ".",
+                           f"laptop-health hogs --tell  (messages that pane with the tips)"))
+    fg, _ = free_gb()
+    if fg < DISK_WARN_GB:
+        causes.append(("critical" if fg < DISK_CRIT_GB else "degraded",
+                       f"Disk has {fg} GB free (at 0.1 GB on 24 Sep herdr crashed and took every agent down).",
+                       "laptop-health disk cargo --run, then disk trees  (then: disk slim --idle --run)"))
+    ds = dev_servers()
+    if len(ds) > 6:
+        causes.append(("degraded", f"{len(ds)} dev servers hold {sum(x[2] for x in ds)/1024:.1f} GB of RAM "
+                       f"({sum(1 for x in ds if x[4] == 0)} with no client right now).", "laptop-health servers"))
+    if strays:
+        causes.append(("degraded", f"{len(strays)} leftover processes ({', '.join(sorted(set(s[0] for s in strays)))}).", "laptop-health strays"))
+    level = 2 if any(c[0] == "critical" for c in causes) else 1 if causes else 0
+    report = {"level": ["healthy", "degraded", "critical"][level], "load": la, "power": pw, "capacity": cap, "memory": mem,
+              "agents": agents, "live_quiet_holds": lq, "heavy": heavy, "strays": [s[:3] for s in strays],
+              "causes": [{"severity": s, "what": w, "fix": f} for s, w, f in causes]}
+    if as_json:
+        print(json.dumps(report, indent=1))
+        return level
+    print(f"{['Healthy', 'Degraded', 'CRITICAL'][level]}: load {la[0]:.1f} / {la[1]:.1f} / {la[2]:.1f} on {NCPU} cores")
+    for i, (s, w, f) in enumerate(causes[:5], 1):
+        print(f"  {i}. {w}\n       fix: {f}")
+    if not causes:
+        print("  nothing stands out")
+    print(f"\npower: {pw['source']} {pw['percent']}% {pw['state']} {pw['remaining']} | Low Power Mode: battery={pw['low_power_mode'].get('Battery')} AC={pw['low_power_mode'].get('AC')}")
+    if "clusters" in cap:
+        print("cpu:   " + "  ".join(f"{k}-cores {v.get('mhz')}/{v.get('max_mhz')} MHz {v.get('active_pct', 0):.0f}% busy" for k, v in cap["clusters"].items()) + f"  thermal {cap['thermal']}")
+    else:
+        print(f"cpu:   {cap.get('error')}")
+    print(f"ram:   {mem['free_mb']} MB free, {mem['compressor_mb']} MB compressed, swap {mem['swap_used_mb']}/{mem['swap_total_mb']} MB")
+    print(f"agents: {agents}" + (f" | live-quiet holding heavy slots (Oracle live): pids {lq}" if lq else ""))
+    return level
+
+
+def cmd_mem(argv):
+    g, big = mem_groups()
+    mem = memory()
+    print(f"ram: {mem['free_mb']} MB free, {mem['compressor_mb']} MB compressed, swap {mem['swap_used_mb']}/{mem['swap_total_mb']} MB\n")
+    print("by kind (real memory incl. compressed):")
+    for k, (n, m) in sorted(g.items(), key=lambda kv: -kv[1][1])[:14]:
+        print(f"  {m/1024:5.2f} GB  x{n:<4d} {k}")
+    print("\nbiggest processes:")
+    for m, pid, r in big:
+        print(f"  {m:6.0f} MB  {pid:<6} up {r['age']/3600:5.1f}h  {short(r['args'], 95)}")
+    return 0
+
+
+def cmd_strays(argv):
+    apply = None
+    if "--apply" in argv:
+        i = argv.index("--apply")
+        apply = set((argv[i + 1] if i + 1 < len(argv) else "all").split(","))
+    s = find_strays()
+    if not s:
+        print("no strays")
+        return 0
+    lq = set(live_quiet())
+    for cat, pid, why, fix in s:
+        act = apply is not None and ("all" in apply or cat in apply) and pid not in lq
+        mark = "stopping" if act else "found"
+        print(f"  [{cat}] {mark} {pid}: {why}\n        fix: {fix}")
+        if act:
+            if "chrome-devtools-axi stop" in fix:
+                # one bridge per named session; a bare `stop` only reaches "default"
+                name = re.search(r"AXI_SESSION=(\S+)", fix).group(1)
+                subprocess.run(["chrome-devtools-axi", "stop"], capture_output=True, timeout=30,
+                               env=dict(os.environ, CHROME_DEVTOOLS_AXI_SESSION=name))
+            elif fix.startswith("sudo kill"):
+                subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)], capture_output=True)
+            else:
+                subprocess.run(["kill", "-TERM", str(pid)], capture_output=True)
+    if apply is None:
+        print("\ndry run. Stop them with: laptop-health strays --apply all   (or one kind: waiters,servers,chrome,axi,loops,monitors)")
+    return 0
+
+
+def sample_run(dur, every=0.25):
+    """Runnable threads per pid, sampled with libproc (root sees every process; a user sees their own)."""
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+
+    class TI(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("vs", "rs", "tu", "ts", "tu2", "ts2")] + \
+                   [(n, ctypes.c_int32) for n in ("pol", "flt", "pgin", "cow", "ms", "mr", "scm", "scu", "csw", "thn", "run", "pri")]
+    buf = (ctypes.c_int * 8192)(); me = os.getpid()
+    run = collections.Counter(); samples = 0; tot = []
+    t0 = time.time()
+    while time.time() - t0 < dur:
+        n = lib.proc_listallpids(buf, ctypes.sizeof(buf)); s = 0
+        for p in buf[:n]:
+            if p == me:
+                continue
+            t = TI()
+            if lib.proc_pidinfo(p, 4, 0, ctypes.byref(t), ctypes.sizeof(t)) == ctypes.sizeof(t) and t.run:
+                run[p] += t.run; s += t.run
+        tot.append(s); samples += 1
+        time.sleep(every)
+    return run, samples, tot
+
+
+def cmd_load(argv):
+    dur = float(argv[0]) if argv and argv[0].replace(".", "").isdigit() else 30
+    if os.geteuid() != 0 and have_sudo():
+        return subprocess.call(["sudo", "-n", sys.executable, os.path.realpath(__file__), "load", str(dur)])
+    run, samples, tot = sample_run(dur)
+    rows = ps_rows()
+    allrun = max(sum(run.values()), 1)
+    print(f"{samples} samples over {dur:.0f}s: on average {sum(tot)/samples:.1f} threads wanted a core (peak {max(tot)}); {NCPU} cores\n")
+    grp = collections.Counter()
+    for p, n in run.items():
+        grp[kind_of(rows[p]["args"]) if p in rows else "short-lived (already gone)"] += n
+    print("share of the load by kind:")
+    for k, n in grp.most_common(10):
+        print(f"  {100*n/allrun:5.1f}%  {n/samples:5.2f} threads  {k}")
+    print("\ntop processes:")
+    for p, n in run.most_common(12):
+        print(f"  {100*n/allrun:5.1f}%  {p:<6} {short(rows[p]['args'], 95) if p in rows else '(gone)'}")
+    return 0
+
+
+CHURN_RULES = [
+    ("console-wait loop (console Stop hook)", r"console/bin/console-wait"),
+    ("SSH sessions coming in (siso-vps Internal Labs etc.)", r"sshd-session"),
+    ("HUD status line", r"hud/siso-hud\.mjs"),
+    ("Claude hooks", r"\.claude/hooks/|harness-lab/hooks/|console/bin/"),
+    ("estate city service", r"tools/city\.py"),
+    ("builds and tests (vitest/tsc/vite/esbuild)", r"vitest|/tsc |tsc -p|vite build|esbuild"),
+    ("Playwright / Chrome", r"_review/|playwright|Google Chrome|chrome-headless"),
+    ("herdr server", r"herdr\.real server"),
+    ("Claude tool calls (commands agents run)", r"shell-snapshots/snapshot"),
+    ("omp / codex workers", r"/omp |codex"),
+    ("Claude CLI itself", r"(^|/)claude( |$)|/claude/versions/"),
+    ("postgres", r"postgres"),
+]
+
+
+def capture_events(dur):
+    """Every fork/exec for dur s via eslogger (sudo): (events [(kind, pid)], args {pid: cmdline}, parent {pid: ppid})."""
+    import signal  # a killed run (tool timeout, closed pane) must still stop eslogger: turn TERM/HUP into the finally below
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with tempfile.TemporaryDirectory(prefix=".siso-ephemeral-churn.", dir=os.environ.get("TMPDIR", "/tmp")) as d:
+        out = os.path.join(d, "es.jsonl")
+        pidf = os.path.join(d, "es.pid")
+        with open(out, "w") as f:
+            # Signal eslogger itself, not sudo: killing sudo's pid left eslogger running as an orphan, writing every
+            # fork/exec to a deleted file (25 Sep: 9 leaked, one at 669 MB). `exec` keeps the pid written to es.pid.
+            proc = subprocess.Popen(["sudo", "-n", "sh", "-c", f"echo $$ > {pidf}; exec /usr/bin/eslogger exec fork"],
+                                    stdout=f, stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(dur)
+            finally:
+                es = open(pidf).read().strip() if os.path.exists(pidf) else str(proc.pid)
+                subprocess.run(["sudo", "-n", "kill", "-INT", es], capture_output=True)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(["sudo", "-n", "kill", "-KILL", es], capture_output=True)
+                    proc.wait(timeout=5)
+        args, parent, events = {}, {}, []
+        for line in sh("ps -Ao pid=,ppid=,args=").splitlines():
+            p = line.split(None, 2)
+            if len(p) == 3:
+                args[int(p[0])] = p[2]; parent[int(p[0])] = int(p[1])
+        for line in open(out):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            pr = e["process"]; pid = pr["audit_token"]["pid"]
+            parent.setdefault(pid, pr.get("ppid")); args.setdefault(pid, (pr.get("executable") or {}).get("path", "?"))
+            ev = e["event"]
+            if "fork" in ev:
+                cp = ev["fork"]["child"]["audit_token"]["pid"]; parent[cp] = pid; args.setdefault(cp, args.get(pid, "?")); events.append(("fork", cp))
+            elif "exec" in ev:
+                tp = ev["exec"]["target"]["audit_token"]["pid"]; args[tp] = " ".join(ev["exec"].get("args") or []) or args.get(tp, "?"); events.append(("exec", tp))
+
+    return events, args, parent
+
+
+def pings(events, args, parent, dur, min_rate=30):
+    """The same command started over and over: [(per_min, command, who keeps starting it)]."""
+    rows = ps_rows()
+    rep, starter = collections.Counter(), {}
+    for kind, pid in events:
+        if kind != "exec":
+            continue
+        key = " ".join(short(args.get(pid, "?")).split()[:4])[:70]
+        rep[key] += 1
+        if key in starter:
+            continue
+        cur = parent.get(pid)
+        for _ in range(40):  # first live ancestor that is an agent, else the first live one
+            if cur in rows:
+                a = agent_ancestor(cur, rows)
+                starter[key] = agent_label(agent_info(a, rows)) if a else short(rows[cur]["args"], 60)
+                break
+            cur = parent.get(cur)
+            if cur in (None, 0, 1):
+                break
+    return [(round(n * 60 / dur), k, starter.get(k, "?")) for k, n in rep.most_common(10) if n * 60 / dur >= min_rate]
+
+
+def cmd_churn(argv):
+    dur = int(float(argv[0])) if argv and argv[0].replace(".", "").isdigit() else 30
+    if not have_sudo():
+        print("needs passwordless sudo for eslogger"); return 1
+    events, args, parent = capture_events(dur)
+
+    def classify(pid):
+        cur = pid
+        for _ in range(40):
+            a = args.get(cur, "")
+            for label, rx in CHURN_RULES:
+                if re.search(rx, a):
+                    return label
+            nxt = parent.get(cur)
+            if nxt in (None, 0, 1) or nxt == cur:
+                return "other: " + os.path.basename(a.split()[0]) if a.split() else "other"
+            cur = nxt
+        return "other"
+    cnt, ex, forks_only = collections.Counter(), collections.defaultdict(collections.Counter), collections.Counter()
+    execd = {p for k, p in events if k == "exec"}
+    for kind, pid in events:
+        lab = classify(pid); cnt[lab] += 1
+        if kind == "exec":
+            ex[lab][" ".join(short(args.get(pid, "?")).split()[:3])[:60]] += 1
+        elif pid not in execd:
+            forks_only[lab] += 1
+    total = max(sum(cnt.values()), 1)
+    print(f"{total} process starts (fork+exec events) in {dur}s = {total*60/dur:.0f}/min\n")
+    for lab, n in cnt.most_common(12):
+        eg = ", ".join(f"{k} x{v}" for k, v in ex[lab].most_common(2))
+        fo = f"  ({forks_only[lab]} forks never ran anything)" if forks_only[lab] > 20 else ""
+        print(f"  {100*n/total:5.1f}%  {n*60/dur:6.0f}/min  {lab}{fo}\n{'':24}{eg[:110]}" if eg else f"  {100*n/total:5.1f}%  {n*60/dur:6.0f}/min  {lab}{fo}")
+    found = pings(events, args, parent, dur)
+    if found:
+        print("\nwhat pings (same command, 30+ starts/min):")
+        for rate, k, who in found:
+            print(f"  {rate:6d}/min  {k}\n{'':12}started by: {who[:110]}")
+    return 0
+
+
+def cmd_history(argv):
+    print("power source (pmset log, last 3 days); Low Power Mode applies on:", power()["low_power_mode"])
+    prev = start = sch = None; out = []
+    since = (datetime.date.today() - datetime.timedelta(days=3)).isoformat()
+    for line in sh("pmset -g log", timeout=60).splitlines():
+        m = re.match(r"(\S+ \S+) .*Using (AC|Batt|BATT)\s*\(Charge: ?(\d+)", line)
+        if not m or m.group(1) < since:
+            continue
+        src = "AC" if m.group(2) == "AC" else "Battery"
+        if src != prev:
+            if prev:
+                out.append((start, m.group(1), prev, sch, m.group(3)))
+            prev, start, sch = src, m.group(1), m.group(3)
+    if prev:
+        out.append((start, "now", prev, sch, "-"))
+    for s, e, src, a, b in out[-14:]:
+        print(f"  {s[5:16]} -> {e[5:16] if e != 'now' else 'now':11}  {src:8} {a}% -> {b}%")
+    print("\nactive Claude sessions per hour (last 36 h):")
+    act = collections.defaultdict(set); now = time.time()
+    off = datetime.datetime.now().astimezone().utcoffset()
+    for f in glob.glob(f"{HOME}/.claude/projects/*/*.jsonl"):
+        if now - os.path.getmtime(f) > 36 * 3600:
+            continue
+        try:
+            with open(f, "rb") as fh:
+                for line in fh:
+                    i = line.find(b'"timestamp":"')
+                    if i >= 0:
+                        try:
+                            t = datetime.datetime.strptime(line[i + 13:i + 32].decode(), "%Y-%m-%dT%H:%M:%S") + off
+                        except ValueError:
+                            continue
+                        act[t.strftime("%m-%d %H:00")].add(f)
+        except OSError:
+            pass
+    for k in sorted(act)[-36:]:
+        n = len(act[k]); print(f"  {k}  {n:3d} {'#' * min(n, 60)}")
+    return 0
+
+
+def cmd_agent(argv):
+    """The launcher is `health` (same folder): `health tab [claude|siso|codex|omp] [question]`."""
+    health = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health")
+    os.execv(health, [health, "tab", *argv])
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv and not argv[0].startswith("-") else "check"
+    rest = argv[1:] if argv and not argv[0].startswith("-") else argv
+    if cmd == "clean":
+        cmd, rest = "strays", ["--apply", "all"]
+    fn = {"check": cmd_check, "load": cmd_load, "churn": cmd_churn, "mem": cmd_mem, "strays": cmd_strays,
+          "history": cmd_history, "agent": cmd_agent,
+          "hogs": cmd_hogs, "servers": cmd_servers, "disk": cmd_disk, "who": cmd_who, "tell": cmd_tell, "watch": cmd_watch, "unheavy": cmd_unheavy, "ramguard": cmd_ramguard}.get(cmd)
+    if not fn or cmd in ("-h", "--help", "help"):
+        print(__doc__); return 0 if cmd in ("-h", "--help", "help") else 2
+    return fn(rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

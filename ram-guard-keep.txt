@@ -1,0 +1,6 @@
+# Agents the RAM guard never parks (regex on pane name + title + folder, case-insensitive). One per line; # starts a note.
+(^|\s)A0(\s|-|$)|A0-NEXT|A0-DESK|agent-zero|firstmate    # Agent Zero and its desk
+HEALTH|laptop-health|ESTATE|EFFICIENCY                    # machine/estate owners
+STREAMING|STREAM-|OPS-|AUTO-VIEWER|oracle|Oracle          # the stream soak (ends 19:51 +07) and its seats
+a0w-003|ab-022                                            # AGENT-BASE: owns the 19:51 live run / browser lane kept
+AGENT-BASE|HUB-DESIGN|HALO-UI|HALO-FACE                   # owners A0 named 17:52 (also covered by the registry)

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# health — open the laptop-health agent right here, in whichever harness you want. It boots in its house
+# (SISO_Agents/laptop-health, so its AGENTS.md playbook loads), runs `laptop-health check` and tells you what is
+# making the laptop slow; then you ask it anything.
+#
+#   health                     Claude (Opus) in this terminal
+#   health siso                Claude on the second login (claude-siso)
+#   health codex               Codex
+#   health omp                 omp on DeepSeek (cheap)
+#   health <question...>       start with your question:  health why is chrome so heavy
+#   health tab [harness] [...] open it in its own herdr tab LAPTOP instead of this terminal
+#   health --print [...]       show the command without running it
+set -euo pipefail
+
+HOUSE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+harness=claude tab=0 print=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --print) print=1 ;;
+    -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+if [ "${1:-}" = tab ]; then tab=1; shift; fi
+case "${1:-}" in claude|siso|codex|omp) harness=$1; shift ;; esac
+ask="${*:-}"
+
+PROMPT="You are the laptop-health agent for Shaan's MacBook. Your playbook is AGENTS.md in this folder; follow it. Run \`laptop-health check\` now and tell Shaan in plain words what is making the laptop slow, with the numbers, and the one fix to do first. Then answer his questions: use laptop-health load, churn, mem, strays and history to find out, and laptop-health clean to stop leftovers. Never kill or touch an agent.${ask:+ His question: $ask}"
+# the prompt goes in a file: a typed terminal line holds about 1 KB (herdr pane run types it)
+mkdir -p "$HOUSE/.claude"
+printf '%s\n' "$PROMPT" > "$HOUSE/.claude/boot-prompt.txt"
+P='"$(cat .claude/boot-prompt.txt)"'
+DS=opencode-go/deepseek-v4.1-flash
+case "$harness" in
+  claude) CMD="claude --model opus $P" ;;
+  siso)   CMD="claude-siso --model opus $P" ;;
+  codex)  CMD="codex $P" ;;
+  omp)    CMD="omp --model $DS --smol $DS --slow $DS $P" ;;
+esac
+
+if [ "$print" = 1 ]; then
+  echo "cd $HOUSE && $CMD"
+  exit 0
+fi
+
+if [ "$tab" = 0 ]; then
+  cd "$HOUSE"
+  exec bash -c "$CMD"
+fi
+
+command -v herdr >/dev/null 2>&1 && herdr tab list >/dev/null 2>&1 || { echo "herdr is not running here; run: health $harness" >&2; exit 1; }
+json() { python3 -c "import sys,json; d=json.load(sys.stdin)['result']; $1"; }
+tab_id=$(herdr tab list | json "print(next((t['tab_id'] for t in d['tabs'] if t.get('label')=='LAPTOP'), ''))")
+if [ -n "$tab_id" ]; then
+  busy=$(herdr pane list | json "print(any(p.get('agent') for p in d['panes'] if p.get('tab_id')=='$tab_id'))")
+  [ "$busy" = True ] && { echo "the laptop-health agent is already running in tab $tab_id"; exit 0; }
+else
+  tab_id=$(herdr tab create --cwd "$HOUSE" --label LAPTOP --focus | json "print((d.get('tab') or d).get('tab_id'))")
+fi
+pane=$(herdr pane list | json "print([p['pane_id'] for p in d['panes'] if p.get('tab_id')=='$tab_id'][0])")
+herdr pane rename "$pane" LAPTOP >/dev/null
+herdr pane run "$pane" "cd '$HOUSE' && $CMD" >/dev/null
+for _ in $(seq 1 30); do herdr agent rename "$pane" LAPTOP >/dev/null 2>&1 && break; sleep 1; done
+echo "laptop-health agent ($harness) started in its own tab $tab_id (pane $pane)"
