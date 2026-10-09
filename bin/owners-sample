@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""owners-sample — RAM and CPU by who started it, sampled over minutes (FLEET-COST, 7 Oct 2026).
+
+Shaan, 6 Oct ~23:20: "figure out why my laptop why this app so ram heavy load heavy and the agents are so load heavy
+and ram heavy". A snapshot lies about CPU, so this samples: every EVERY seconds for MINUTES minutes it reads every
+process (pid, ppid, RSS, CPU time) and charges each one to its owner, the first of:
+  - an Agent Base hosted chat (a host pid in ~/.local/state/agent-base/hosts/*.json) -> "chat NAME";
+  - an agent CLI in a herdr pane -> "pane NAME";
+  - the Agent Base app (its node server and its web view) -> "Agent Base app";
+  - a WebKit/XPC helper -> the app macOS says is responsible for it (launchctl procinfo, sudo);
+  - a launchd service -> its label; an app bundle -> the app; else the top command below launchd.
+CPU is CPU-time used between samples (cores), not ps's decaying %cpu.
+
+  owners-sample [MINUTES=10] [EVERY=30] [--json FILE]
+Read-only: it stops nothing.
+"""
+import collections, glob, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+loader = importlib.machinery.SourceFileLoader("lh", os.path.join(HERE, "laptop-health"))
+spec = importlib.util.spec_from_loader("lh", loader)
+lh = importlib.util.module_from_spec(spec)
+loader.exec_module(lh)
+
+
+def sh(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str)).stdout
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def snap():
+    rows = {}
+    for line in sh("ps -Ao pid=,ppid=,rss=,time=,args=").splitlines():
+        p = line.split(None, 4)
+        if len(p) == 5 and p[0].isdigit():
+            rows[int(p[0])] = {"ppid": int(p[1]), "rss": int(p[2]) / 1024, "cpu": lh.secs(p[3]), "args": p[4]}
+    return rows
+
+
+def hosts():
+    out = {}
+    for f in glob.glob(os.path.expanduser("~/.local/state/agent-base/hosts/*.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if d.get("pid") and d.get("name"):
+            out[int(d["pid"])] = d["name"]
+    return out
+
+
+def launchd_labels():
+    labels = {}
+    for line in sh("launchctl list").splitlines()[1:]:
+        p = line.split("\t") if "\t" in line else line.split()
+        if p and p[0].strip().isdigit():
+            labels[int(p[0])] = p[-1].strip()
+    return labels
+
+
+_resp = {}
+
+
+def responsible(pid):
+    """The app macOS holds responsible for an XPC helper (WebKit web views), via launchctl procinfo."""
+    if pid not in _resp:
+        out = sh(["sudo", "-n", "launchctl", "procinfo", str(pid)], timeout=10)
+        m = re.search(r"responsible pid = (\d+)", out)
+        _resp[pid] = int(m.group(1)) if m else None
+    return _resp[pid]
+
+
+APP_RX = re.compile(r"/Applications/([^/]+)\.app")
+_owner = {}
+
+
+def owner(pid, rows, host_pids, labels, depth=0):
+    if pid in _owner:
+        return _owner[pid]
+    r = rows.get(pid)
+    if not r or depth > 40:
+        return "?"
+    a = r["args"]
+    up, hop = pid, 0
+    while up in rows and up not in host_pids and rows[up]["ppid"] not in (0, 1) and hop < 40:
+        up, hop = rows[up]["ppid"], hop + 1
+    if up in host_pids:  # anything under a hosted chat, its CLI included, is that chat's
+        o = f"chat {host_pids[up]}"
+    elif "Agent Base.app" in a or "siso-agent-base-local" in a:
+        o = "Agent Base app"
+    elif "services/node/src/server.ts" in a and "agent-base" in a:
+        o = "Agent Base app"
+    elif lh.AGENT_RX.search(a) and "codex-router" not in a and "claude-agent-sdk" not in a:
+        i = lh.agent_info(pid, rows)
+        o = f"pane {i.get('name') or i.get('pane')}" if i.get("pane") else f"{i['kind']} (no pane)"
+    elif r["ppid"] in (0, 1):
+        if "com.apple.WebKit" in a or "XPCServices" in a:
+            rp = responsible(pid)
+            o = owner(rp, rows, host_pids, labels, depth + 1) if rp and rp != pid and rp in rows else "WebKit (unknown app)"
+            if o.startswith("WebKit") or o == "?":
+                o = "WebKit (unknown app)"
+        elif pid in labels and not labels[pid].startswith("com.apple."):
+            o = f"service {labels[pid]}"
+        elif APP_RX.search(a):
+            o = APP_RX.search(a).group(1)
+        elif a.startswith(("/System/", "/usr/", "/sbin/", "/Library/Apple")):
+            o = "macOS"
+        else:
+            o = lh.short(a.split()[0].rsplit("/", 1)[-1], 40)
+    else:
+        o = owner(r["ppid"], rows, host_pids, labels, depth + 1)
+    _owner[pid] = o
+    return o
+
+
+def main(argv):
+    nums = [a for a in argv if a.replace(".", "").isdigit()]
+    minutes = float(nums[0]) if nums else 10
+    every = float(nums[1]) if len(nums) > 1 else 30
+    out = argv[argv.index("--json") + 1] if "--json" in argv else None
+    host_pids, labels = hosts(), launchd_labels()
+    rss = collections.defaultdict(list)
+    cpu = collections.Counter()
+    procs = collections.defaultdict(set)
+    prev, t0 = snap(), time.time()
+    n, t_prev = 0, t0
+    while time.time() - t0 < minutes * 60:
+        time.sleep(every)
+        cur, t = snap(), time.time()
+        host_pids.update(hosts())
+        per = collections.Counter()
+        for pid, r in cur.items():
+            o = owner(pid, cur, host_pids, labels)
+            per[o] += r["rss"]
+            procs[o].add(pid)
+            p = prev.get(pid)
+            if p and p["args"] == r["args"]:
+                cpu[o] += max(0.0, r["cpu"] - p["cpu"])
+            else:  # born since the last sample: all of its CPU time is new
+                cpu[o] += r["cpu"]
+        for o, v in per.items():
+            rss[o].append(v)
+        for o in rss:
+            if o not in per:
+                rss[o].append(0)
+        dt = t - t_prev
+        cpu["__seconds__"] += dt
+        prev, t_prev, n = cur, t, n + 1
+        _owner.clear()
+    span = cpu.pop("__seconds__", 1) or 1
+    rows = [{"owner": o, "procs": len(procs[o]), "rss_avg_mb": round(sum(v) / max(1, len(v))), "rss_max_mb": round(max(v)),
+             "cores_avg": round(cpu[o] / span, 2)} for o, v in rss.items()]
+    rows.sort(key=lambda x: -(x["rss_avg_mb"] / 1024 + x["cores_avg"]))
+    tot_mb = sum(x["rss_avg_mb"] for x in rows)
+    tot_cores = sum(x["cores_avg"] for x in rows)
+    print(f"{n} samples over {span / 60:.1f} min, every {every:.0f} s.  RSS total {tot_mb / 1024:.1f} GB, CPU {tot_cores:.2f} cores")
+    print(f"{'owner':<40}{'procs':>6}{'RAM avg':>9}{'RAM max':>9}{'cores':>7}")
+    for x in rows[:40]:
+        print(f"{x['owner'][:39]:<40}{x['procs']:>6}{x['rss_avg_mb']:>8}M{x['rss_max_mb']:>8}M{x['cores_avg']:>7.2f}")
+    if out:
+        json.dump({"at": t0, "minutes": span / 60, "samples": n, "every": every, "rows": rows,
+                   "load": os.getloadavg(), "swap": sh("sysctl -n vm.swapusage").strip()}, open(out, "w"), indent=1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
