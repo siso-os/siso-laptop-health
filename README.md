@@ -18,8 +18,51 @@
 </p>
 
 <!-- /siso-os:header -->
-## What it is
 
-Keeps a Mac that runs a fleet of agents healthy: memory, disk and process rules, checked on a schedule.
+Find out why your Mac is slow, in about ten seconds. SISO Laptop Health checks the causes in the order that has paid off
+for us running many coding agents on one laptop: Low Power Mode first, then CPU, then memory, then which process or agent
+is heavy. It never kills an agent; it tells you, or the agent, what to stop.
 
-It is part of **Agent Base** in [SISO OS](https://github.com/siso-os), the open-source agent operating system we run SISO on. More on [the website](https://www.sisolabs.space/spyder/).
+It uses the tools macOS already has: `pmset`, `powermetrics`, `eslogger` and `ps`.
+More on [the website](https://www.sisolabs.space/agent-base/).
+
+## Install
+
+You need macOS and Python 3. The CPU speed check, `load` and `churn` read `powermetrics` and `eslogger`, which need
+passwordless `sudo`; without it they say so and the rest still runs.
+
+```bash
+git clone https://github.com/siso-os/siso-laptop-health.git
+cd siso-laptop-health
+export PATH="$PWD/bin:$PATH"   # add this line to ~/.zshrc to keep it
+laptop-health check
+```
+
+## Use it
+
+- `laptop-health check`: the ten-second triage: power and Low Power Mode, CPU speed, load, memory, strays, and the
+  causes ranked with a fix for each.
+- `laptop-health load [secs]`: which processes make up the load average (30 seconds by default).
+- `laptop-health churn [secs]`: what keeps starting new processes.
+- `laptop-health mem`: real memory use, compressed memory included, by kind and by process.
+- `laptop-health servers`: every dev and file server running, with its RAM, age and folder.
+- `laptop-health strays`, then `laptop-health clean`: find, then stop, leftovers such as orphaned dev servers and idle
+  browsers.
+- `laptop-health disk`: free space, and what is taking it.
+- `laptop-health watch --install`: a check every 10 minutes, logged to `~/.cache/laptop-health/watch.jsonl`, so you
+  can see a normal day.
+- `laptop-health --help`: everything else, including `who <pid>` (what started a process) and `history` (power and Low
+  Power Mode over time).
+
+## How it works
+
+- **Ranked causes:** a Mac on battery in Low Power Mode caps its fast cores, which looks like an overloaded machine, so
+  power is checked before anything else. You stop at the first cause that explains the numbers.
+- **Agents are never killed:** `strays` and `clean` only stop leftovers (orphaned servers with no clients, idle
+  browsers, loops from ended sessions). For heavy agents, `hogs` gives a tip from `tips.json`.
+- **Built for agent fleets:** `hogs`, `who` and `tell` know about agent panes run in [herdr](https://github.com/herdrdev/herdr);
+  everything else works on any Mac.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

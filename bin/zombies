@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""zombies — the leftovers `laptop-health strays` misses, found by reading each tree (FLEET-COST, 7 Oct 2026).
+
+Shaan, 6 Oct ~23:15: "the fan's going off like crazy and I feel like it's some zombie processes". Measured 7 Oct 00:40-00:50
+(bin/owners-sample): real orphans are few and small; RAM goes to live chats and apps. These are the ones that were left:
+
+  waiters    a Bash tool shell from an ended Claude session (parent gone, up 1 h+) whose whole tree only waits
+             (tail -F, grep, cut, sleep...): e.g. a 4-day-old `tail -F a0/inbox.log | grep` nobody reads.
+  launchers  an `npm exec` / `npx` / `pnpm exec|dlx` whose starter is gone (up 6 h+) and whose dev server (vite, next,
+             webpack, astro, storybook) has no client on any port. strays only looks at a server whose own parent is gone.
+  ghosts     Agent Base host records (~/.local/state/agent-base/hosts/*.json) whose host process is dead. Reported only:
+             they make a chat look alive to anyone counting the fleet.
+
+Never touched: anything with a living parent (so nothing under a live chat, agent CLI or app), launchd services,
+keep.txt matches (command line or folder), `npm start` style services (camofox on :9377 is one).
+Stops go through `jobstop <pid>` (the whole tree, then proof nothing is left), never pkill.
+
+  zombies [--json]            dry run: what it would stop and why
+  zombies --apply [KIND,...]  stop them (waiters, launchers); ghosts are never acted on
+"""
+import glob, importlib.machinery, importlib.util, json, os, re, subprocess, sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+loader = importlib.machinery.SourceFileLoader("lh", os.path.join(HERE, "laptop-health"))
+spec = importlib.util.spec_from_loader("lh", loader)
+lh = importlib.util.module_from_spec(spec)
+loader.exec_module(lh)
+
+WAIT_ONLY = re.compile(r"^(\S*/)?(tail|grep|egrep|cut|sleep|awk|sed|head|cat|tr|wc|date|zsh|bash|sh)$")
+DEV_SERVER = re.compile(r"\bvite\b|next dev|webpack|astro dev|storybook")
+LAUNCHER = re.compile(r"^(npm exec|npx|pnpm (exec|dlx)|node \S*/npx-cli\.js)\b")
+HOSTS = os.path.expanduser("~/.local/state/agent-base/hosts")
+
+
+def tree(pid, rows):
+    kids = {}
+    for p, r in rows.items():
+        kids.setdefault(r["ppid"], []).append(p)
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        todo += kids.get(p, [])
+    return out
+
+
+def cwd_of(pid):
+    return lh.sh(f"lsof -a -p {pid} -d cwd -Fn").partition("\nn")[2].strip()
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def find(rows=None):
+    rows = rows or lh.ps_rows()
+    lps, keep, listen = lh.launchd_pids(), lh.keep_patterns(), lh.listening()
+    found = []  # (kind, pid, why)
+    for p, r in rows.items():
+        if r["ppid"] != 1 or p in lps or any(k.search(r["args"]) for k in keep):
+            continue
+        t = tree(p, rows)
+        if "shell-snapshots/snapshot" in r["args"] and r["age"] > 3600:
+            cmds = [rows[q]["args"].split()[0] for q in t if q in rows]
+            if all(WAIT_ONLY.match(c) for c in cmds) and len(t) > 1:
+                what = " | ".join(lh.short(rows[q]["args"], 50) for q in t[1:4] if q in rows)
+                found.append(("waiters", p, f"Bash shell from an ended Claude session, up {r['age'] / 3600:.1f}h, only waits: {what}"))
+        elif LAUNCHER.search(r["args"]) and r["age"] > 6 * 3600:
+            servers = [q for q in t if q in rows and DEV_SERVER.search(rows[q]["args"])]
+            ports = sorted({pt for q in t for pt in listen.get(q, ())})
+            cwd = cwd_of(p)
+            if any(k.search(cwd) for k in keep):
+                continue
+            if servers and all(lh.clients(pt) == 0 for pt in ports):
+                found.append(("launchers", p, f"{lh.short(r['args'], 60)} in {lh.short(cwd, 70)}: starter gone, up {r['age'] / 3600:.1f}h, "
+                                             f"ports {','.join(ports) or 'none'} with no clients"))
+    for f in sorted(glob.glob(os.path.join(HOSTS, "*.json"))):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if d.get("pid") and not alive(d["pid"]):
+            found.append(("ghosts", d["pid"], f"host record {os.path.basename(f)} ({d.get('name')}) points at a dead host; state says {d.get('state')}"))
+    return found
+
+
+def main(argv):
+    found = find()
+    apply = "--apply" in argv
+    kinds = set((argv[argv.index("--apply") + 1] if apply and len(argv) > argv.index("--apply") + 1 else "waiters,launchers").split(","))
+    if "--json" in argv:
+        print(json.dumps([{"kind": k, "pid": p, "why": w} for k, p, w in found], indent=1))
+        return 0
+    for k, p, w in found:
+        print(f"  [{k}] {p}: {w}")
+    if not found:
+        print("no zombies")
+    if not apply:
+        print("\ndry run. Stop them with: zombies --apply   (or one kind: --apply waiters | launchers)")
+        return 0
+    for k, p, w in found:
+        if k in kinds and k != "ghosts":
+            r = subprocess.run(["jobstop", str(p)], capture_output=True, text=True, timeout=30)
+            print(f"  stopped {p} ({k}): rc={r.returncode} {r.stdout.strip()[-200:]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
