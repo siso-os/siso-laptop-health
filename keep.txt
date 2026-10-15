@@ -6,3 +6,4 @@ camofox-browser                  # :9377 headless browser for agents
 siso-agent-base-local            # :8890 agent base edge (launchd)
 SISO Internal\.app               # :3001 Internal Labs local api
 codex-router                     # :4200-4208 Codex's local router
+halo-press/profile               # :9340 headless Chrome of Shaan's LIVE show camera (HALO v2/deploy/press.mjs); killing it ends the show (A0, 15 Oct)
