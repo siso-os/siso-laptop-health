@@ -5,9 +5,9 @@ HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 hw = importlib.machinery.SourceFileLoader('hw', os.path.join(HOUSE, 'bin/health-watch')).load_module()
 linux = '''4\n0.50 1.00 0.70 1/100 1\nsome avg10=2.00 avg60=3.00 avg300=1.00 total=5\nMemTotal: 1000 kB\nMemAvailable: 500 kB\nFilesystem 1024-blocks Used Available Capacity Mounted on\n/dev/root 1000 500 500 50% /\n'''
 mac = '''8\n{ 0.80 1.00 1.20 }\nMach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 10.\nPages inactive: 20.\nPages speculative: 5.\nPages purgeable: 5.\n1000000\nFilesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 1000 500 500 50% /System/Volumes/Data\n'''
-assert hw.parse_sample('linux', linux) == {'cores':4,'load5':1.0,'pressure':3.0,'ram':50.0,'disk':50.0,'disk_gb':500/1048576}
+assert hw.parse_sample('linux', linux) == {'cores':4,'load1':0.5,'load5':1.0,'pressure':3.0,'ram':50.0,'disk':50.0,'disk_gb':500/1048576}
 m = hw.parse_sample('macos', mac)
-assert m['cores'] == 8 and m['load5'] == 1.0 and m['ram'] == 40*4096/1000000*100 and m['disk'] == 50
+assert m['cores'] == 8 and m['load1'] == 0.8 and m['load5'] == 1.0 and m['ram'] == 40*4096/1000000*100 and m['disk'] == 50
 m16 = hw.parse_sample('macos', mac.replace('page size of 4096', 'page size of 16384'))
 assert m16['ram'] == 40*16384/1000000*100, m16   # Apple silicon: 16 KB pages (4096 hard-coded under-reported RAM 4x)
 assert hw.charge_ma('"ExternalConnected" = Yes\n"CurrentCapacity" = 6\n"InstantAmperage" = 145') == 145.0   # 3 Oct: on AC at 6%, +145 mA
@@ -21,36 +21,62 @@ try:
     hw.sample=lambda machine,cfg: {'cores':4,'load5':10,'pressure':0,'ram':50,'disk':50,'disk_gb':40}
     hw.tell=lambda msg: True; hw.top=lambda cfg: [hw.safe('worker --token=x')]
     state={}; cfg={'os':'linux'}
-    for _ in range(4): hw.one('box',cfg,state)
+    for _ in range(4): hw.one('box',cfg,state,allow_actions=True)
     assert not os.path.exists(hw.WAKE)
-    hw.one('box',cfg,state); assert len(open(hw.WAKE).readlines()) == 1
-    hw.one('box',cfg,state); assert len(open(hw.WAKE).readlines()) == 1
+    hw.one('box',cfg,state,allow_actions=True); assert len(open(hw.WAKE).readlines()) == 1
+    hw.one('box',cfg,state,allow_actions=True); assert len(open(hw.WAKE).readlines()) == 1
     assert '***' in open(hw.WAKE).read()
     hw.sample=lambda machine,cfg: {'cores':4,'load5':0,'pressure':0,'ram':50,'disk':50,'disk_gb':40}
-    for _ in range(4): hw.one('box',cfg,state)
+    for _ in range(4): hw.one('box',cfg,state,allow_actions=True)
     assert len(open(hw.WAKE).readlines()) == 1
-    hw.one('box',cfg,state)
+    hw.one('box',cfg,state,allow_actions=True)
     rows=[json.loads(x) for x in open(hw.WAKE)]; assert [x['state'] for x in rows] == ['opened','cleared']
     # unreachable is a separate consecutive counter and opens only at 15
     state={}; hw.sample=lambda *a: (_ for _ in ()).throw(RuntimeError('down'))
-    for _ in range(14): hw.one('down',cfg,state)
+    for _ in range(14): hw.one('down',cfg,state,allow_actions=True)
     assert not any(x.get('machine')=='down' and x.get('metric')=='unreachable' for x in map(json.loads,open(hw.WAKE)))
-    hw.one('down',cfg,state); rows=[json.loads(x) for x in open(hw.WAKE)]
+    hw.one('down',cfg,state,allow_actions=True); rows=[json.loads(x) for x in open(hw.WAKE)]
     assert rows[-1]['machine']=='down' and rows[-1]['metric']=='unreachable'
     # a wake whose tell fails is retried each pass, then handed to the A0 inbox after 3 failures (2 Oct 17:13 miss)
     hw.A0_INBOX=os.path.join(tmp,'inbox.log'); sent=[]; hw.tell=lambda msg: (sent.append(msg), False)[1]
     hw.sample=lambda machine,cfg: {'cores':4,'load5':10,'pressure':0,'ram':50,'disk':50,'disk_gb':40}; state={}
-    for _ in range(5): hw.one('retry',cfg,state)
+    for _ in range(5): hw.one('retry',cfg,state,allow_actions=True)
     assert len(sent)==2, sent                     # the wake + its first retry in the same pass
-    hw.one('retry',cfg,state); hw.one('retry',cfg,state)
+    hw.one('retry',cfg,state,allow_actions=True); hw.one('retry',cfg,state,allow_actions=True)
     assert 'HEALTH pane unreachable' in open(hw.A0_INBOX).read() and not state['retry']['load']['pending']
-    n=len(sent); hw.one('retry',cfg,state); assert len(sent)==n
+    n=len(sent); hw.one('retry',cfg,state,allow_actions=True); assert len(sent)==n
     # disk_gb: an absolute floor that wakes after 2 samples even while the % disk alert has been open for days
     hw.tell=lambda msg: True; state={}; n=len(open(hw.WAKE).readlines())
     hw.sample=lambda machine,cfg: {'cores':4,'load5':0,'pressure':0,'ram':50,'disk':2,'disk_gb':2.5}
-    hw.one('full',cfg,state); assert len(open(hw.WAKE).readlines()) == n
-    hw.one('full',cfg,state); rows=[json.loads(x) for x in open(hw.WAKE)][n:]
+    hw.one('full',cfg,state,allow_actions=True); assert len(open(hw.WAKE).readlines()) == n
+    hw.one('full',cfg,state,allow_actions=True); rows=[json.loads(x) for x in open(hw.WAKE)][n:]
     assert [(x['metric'],x['state']) for x in rows] == [('disk_gb','opened')], rows
-    print('ok: Linux/macOS fixtures, 4/5/6 breach, 5 clean, masking, 15 unreachable, failed wake retried then to A0 inbox, disk_gb floor wakes after 2')
+    # Owner preflight is isolated: no real host, memory probe or Node invocation.
+    from types import SimpleNamespace
+    hw.HOUSE=hw.SEAT=tmp
+    hw.OWNER_POLICY=os.path.join(tmp,'owner.json')
+    owner_state=os.path.join(tmp,'owner-state.json'); host_path=os.path.join(tmp,'host.json')
+    with open(hw.OWNER_POLICY,'w') as f:
+        json.dump({'enabled':True,'statePath':owner_state,'hostPath':host_path},f)
+    host={'name':'HEALTH','cwd':tmp,'state':'working','child':'running'}
+    with open(host_path,'w') as f: json.dump(host,f)
+    owner_calls=[]
+    hw.owner_free_pct=lambda: owner_calls.append('memory') or 50
+    hw.subprocess.run=lambda *a,**k: owner_calls.append('node') or SimpleNamespace(returncode=1,stdout='{"reason":"unsupported-protocol"}')
+    assert hw.maybe_owner({'laptop':{'load1':1,'cores':8}})['status']=='host-busy'
+    assert owner_calls==[]
+    host['state']='idle'
+    with open(host_path,'w') as f: json.dump(host,f)
+    assert hw.maybe_owner({'laptop':{'load1':9,'load5':1,'cores':8}})['status']=='capacity-load'
+    assert owner_calls==[]
+    assert hw.maybe_owner({'laptop':{'load1':1,'cores':8}})['status']=='unsupported-protocol'
+    assert owner_calls==['memory','node']
+    hw.owner_free_pct=lambda: 30
+    assert hw.maybe_owner({'laptop':{'load1':1,'cores':8}})['status']=='capacity-memory'
+    with open(owner_state,'w') as f: json.dump({'cooldownUntil':hw.time.time()*1000+60000},f)
+    before=len(owner_calls)
+    assert hw.maybe_owner({'laptop':{'load1':1,'cores':8}})['status']=='cooldown'
+    assert len(owner_calls)==before
+    print('ok: Linux/macOS samples, alert policy, masked secrets, load1 owner budget, cheap busy/cooldown and isolated protocol refusal')
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

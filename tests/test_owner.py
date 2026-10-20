@@ -40,7 +40,11 @@ def fake_sh(cmd, timeout=60):
 
 lh.sh = fake_sh
 lh.ps_rows = lambda: ROWS
-lh.sample_run = lambda dur, every=0.25: ({WHISPER: 12, AGENT: 1, HERDR: 1}, 4, [4, 3, 4, 3])
+def sample_run(dur, every=0.25, observed=None):
+    if observed is not None:
+        observed.update({p: (100, 0, "fixture") for p in (WHISPER, AGENT, HERDR)})
+    return {WHISPER: 12, AGENT: 1, HERDR: 1}, 4, [4, 3, 4, 3]
+lh.sample_run = sample_run
 
 # 1. the whisper load belongs to the Claude session's pane, with the local-whisper tip found via the process
 groups, rows, samples, avg = lh.hogs(1)
