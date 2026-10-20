@@ -13,6 +13,8 @@
 set -euo pipefail
 
 HOUSE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# the seat lives in the shared checkout, also when this runs from the live tree (decisions/0028); never in live
+HOUSE="${HEALTH_SEAT_HOUSE:-${HOUSE/\/_data\/worktrees\/siso\/live\//\/_data\/worktrees\/siso\/main\/}}"
 harness=claude tab=0 print=0
 args=()
 for a in "$@"; do

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Low cost, sustained health alerts for the machines in health-machines.json."""
-import datetime, json, os, re, subprocess, sys, tempfile, threading, time
+"""Cheap local laptop monitoring. Remote probes require --fleet; actions require --allow-actions."""
+import datetime, fcntl, json, os, re, subprocess, sys, tempfile, threading, time
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# the seat's house (its .agents state, its cwd): the shared checkout, also when this runs from the live tree (decisions/0028)
+SEAT = os.environ.get('HEALTH_SEAT_HOUSE') or HOUSE.replace('/_data/worktrees/siso/live/', '/_data/worktrees/siso/main/')
 HOME = os.path.expanduser('~')
 CACHE = os.path.join(HOME, '.cache', 'health-watch')
 A0_INBOX = os.path.join(HOME, 'SISO_Workspace/SISO_Agents/agent-zero/siso-firstmate/.agents/a0/inbox.log')
 STATE = os.path.join(CACHE, 'state.json')
-WAKE = os.path.join(HOUSE, '.agents', 'wake.jsonl')
+WAKE = os.path.join(SEAT, '.agents', 'wake.jsonl')
+OWNER_POLICY = os.path.join(SEAT, '.agents', 'health-owner.json')
 LABEL = 'com.siso.health-watch'
 DEFAULTS = {'load': 1.5, 'pressure': 40, 'ram': 10, 'disk': 10, 'disk_gb': 3, 'unreachable': 15}
 # disk_gb: absolute floor, 2 samples. On a big disk 'disk < 10 %' stays open for days and never wakes again; 24 Sep, 137 MB free crashed herdr and every agent
@@ -22,7 +25,7 @@ def safe(s):
 def parse_sample(osname, text):
     lines = text.splitlines()
     if osname == 'linux':
-        cores = int(lines[0]); load = float(lines[1].split()[1]); pressure = 0.0
+        cores = int(lines[0]); loads = lines[1].split(); load1 = float(loads[0]); load = float(loads[1]); pressure = 0.0
         for line in lines[2:]:
             if line.startswith('some '):
                 m = re.search(r'avg60=([\d.]+)', line)
@@ -35,23 +38,48 @@ def parse_sample(osname, text):
                 fields = line.split()
                 if len(fields) >= 5: disk = 100 * int(fields[3]) / int(fields[1]); disk_gb = int(fields[3]) / 1048576
         if not cores or not memtotal or memavail is None or disk is None: raise ValueError('incomplete Linux sample')
-        return {'cores': cores, 'load5': load, 'pressure': pressure, 'ram': 100 * memavail / memtotal, 'disk': disk, 'disk_gb': disk_gb}
+        return {'cores': cores, 'load1': load1, 'load5': load, 'pressure': pressure, 'ram': 100 * memavail / memtotal, 'disk': disk, 'disk_gb': disk_gb}
     cores = int(lines[0]); loadline = lines[1]
     loads = re.findall(r'[\d.]+', loadline)
-    load = float(loads[1] if len(loads) > 1 else loads[0])
-    ps = re.search(r'page size of (\d+) bytes', text)
-    page = int(ps.group(1)) if ps else 4096  # Apple silicon pages are 16384; 4096 under-reported RAM 4x (2 Oct)
-    stats = {}
-    for line in lines[2:]:
-        m = re.match(r'([^:]+):\s+(\d+)', line)
-        if m: stats[m.group(1).strip()] = int(m.group(2))
+    load1 = float(loads[0]); load = float(loads[1] if len(loads) > 1 else loads[0])
     # sysctl memsize follows vm_stat; df is last.
     idx = next(i for i,x in enumerate(lines) if x.startswith('Mach Virtual Memory Statistics'))
     memsize = int(next(x for x in lines[idx+1:] if x.isdigit()))
-    available = sum(stats.get(k, 0) for k in ('Pages free', 'Pages inactive', 'Pages speculative', 'Pages purgeable')) * page
+    available = mac_available(text)
     df = next(x.split() for x in lines if x.startswith('/dev/') or x.startswith('map '))
     disk = 100 * int(df[3]) / int(df[1])
-    return {'cores': cores, 'load5': load, 'pressure': None, 'ram': 100 * available / memsize, 'disk': disk, 'disk_gb': int(df[3]) / 1048576}
+    return {'cores': cores, 'load1': load1, 'load5': load, 'pressure': None, 'ram': 100 * available / memsize, 'disk': disk, 'disk_gb': int(df[3]) / 1048576}
+
+
+def mac_available(text):
+    match = re.search(r'page size of (\d+) bytes', text)
+    if not match:
+        raise ValueError('missing vm_stat page size')
+    stats = {m.group(1).strip(): int(m.group(2))
+             for m in re.finditer(r'^([^:\n]+):\s+(\d+)', text, re.M)}
+    keys = ('Pages free', 'Pages inactive', 'Pages speculative', 'Pages purgeable')
+    if not all(k in stats for k in keys):
+        raise ValueError('incomplete vm_stat memory sample')
+    return sum(stats[k] for k in keys) * int(match.group(1))
+
+
+def local_sample():
+    # Native calls avoid a shell/perl pipeline and four utility starts per check.
+    loads = os.getloadavg()
+    total = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    available = mac_available(run(['/usr/bin/vm_stat']))
+    disk = os.statvfs('/System/Volumes/Data')
+    if total <= 0 or disk.f_blocks <= 0:
+        raise ValueError('invalid native capacity')
+    result = {'cores': os.cpu_count() or 1, 'load1': loads[0], 'load5': loads[1],
+              'pressure': None, 'ram': 100 * available / total,
+              'disk': 100 * disk.f_bavail / disk.f_blocks,
+              'disk_gb': disk.f_bavail * disk.f_frsize / 1024**3}
+    try:
+        result['charge_ma'] = charge_ma(run(['/usr/sbin/ioreg', '-rn', 'AppleSmartBattery']))
+    except Exception:
+        result['charge_ma'] = 9999.0
+    return result
 
 
 def run(cmd, timeout=12):
@@ -79,6 +107,8 @@ def charge_ma(text):
 
 def sample(machine, cfg):
     osname = cfg['os']
+    if cfg.get('local') and osname == 'macos':
+        return local_sample()
     if osname == 'linux': cmd = "timeout 10 sh -c 'nproc; cat /proc/loadavg; grep some /proc/pressure/cpu; grep -E \"MemTotal|MemAvailable\" /proc/meminfo; df -Pk /'"
     else: cmd = MAC_TIMEOUT + "sh -c 'sysctl -n hw.ncpu vm.loadavg; vm_stat; sysctl -n hw.memsize; df -Pk /System/Volumes/Data'"
     if cfg.get('local'):
@@ -87,9 +117,6 @@ def sample(machine, cfg):
     else:
         raw = run(ssh_cmd(cfg, cmd))
     v = parse_sample(osname, raw)
-    if cfg.get('local') and osname == 'macos':
-        try: v['charge_ma'] = charge_ma(run(['ioreg', '-rn', 'AppleSmartBattery']))
-        except Exception: v['charge_ma'] = 9999.0
     return v
 
 
@@ -102,6 +129,24 @@ def load_state():
 def append(obj):
     os.makedirs(os.path.dirname(WAKE), exist_ok=True)
     with open(WAKE, 'a') as f: f.write(json.dumps(obj) + '\n')
+
+
+def locked(fn):
+    """Serialize launchd/manual passes; a busy watcher is safely skipped."""
+    def wrapped(*args, **kwargs):
+        os.makedirs(CACHE, exist_ok=True)
+        path = os.path.join(CACHE, 'watch.lock')
+        with open(path, 'w') as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({'status': 'skipped', 'reason': 'watch lock held'}))
+                return
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return wrapped
 
 
 def tell(msg):
@@ -119,7 +164,54 @@ def top(cfg):
     return [safe(x) for x in rows if x.split()[-1:] and x.split()[-1].rsplit('/', 1)[-1] not in own][:7]
 
 
-def one(machine, cfg, state):
+def owner_free_pct():
+    try:
+        text = run(['memory_pressure'], timeout=5)
+        m = re.search(r'free percentage:\s*(\d+)%', text, re.I)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def maybe_owner(results):
+    """Cheap local preflight; Node is never spawned for a working/non-due host."""
+    try:
+        try:
+            with open(OWNER_POLICY) as f: policy = json.load(f)
+        except OSError:
+            return {'status': 'disabled'}
+        if policy.get('enabled') is not True: return {'status': 'disabled'}
+        due = max(1800, float(policy.get('cadence_seconds', policy.get('dueSeconds', 1800))))
+        state_path = policy.get('statePath') or os.path.join(SEAT, '.agents', 'health-owner-state.json')
+        if not os.path.isabs(state_path): state_path = os.path.join(SEAT, state_path)
+        try:
+            st = json.load(open(state_path))
+            if time.time() * 1000 < float(st.get('cooldownUntil', 0)): return {'status': 'cooldown'}
+        except (OSError, ValueError): pass
+        host_name = policy.get('host_name', 'HEALTH')
+        host_path = policy.get('hostPath') or os.path.join(HOME, f'.local/state/agent-base/hosts/name-{host_name}.json')
+        if not os.path.isabs(host_path): host_path = os.path.join(SEAT, host_path)
+        host = json.load(open(host_path))
+        if (host.get('name') != 'HEALTH' or host.get('cwd') != SEAT or host.get('state') != 'idle' or
+                host.get('child') != 'running'): return {'status': 'host-busy'}
+        local = results.get('laptop', {})
+        max_load = float(policy.get('max_load_per_core', 1.0)) * local.get('cores', 0)
+        if local.get('load1') is None or local['load1'] >= max_load: return {'status': 'capacity-load'}
+        free = owner_free_pct()
+        if free is None or free <= float(policy.get('min_memory_pressure_free_pct', 30)): return {'status': 'capacity-memory'}
+        script = os.path.join(HOUSE, 'bin', 'health-owner.mjs')
+        cp = subprocess.run(['node', script, '--policy', OWNER_POLICY], capture_output=True, text=True, timeout=8)
+        try:
+            report = json.loads(cp.stdout.strip().splitlines()[-1])
+            reason = report.get('reason') if report.get('reason') in {'unsupported-protocol', 'unreconciled', 'cooldown', 'host not idle', 'host child', 'host cwd', 'host permissions'} else None
+            return {'status': 'submitted' if cp.returncode == 0 else (reason or 'blocked')}
+        except Exception:
+            return {'status': 'submitted' if cp.returncode == 0 else 'blocked'}
+    except Exception as e:
+        return {'status': 'preflight-error'}
+
+
+def one(machine, cfg, state, allow_actions=False):
     now = datetime.datetime.now().astimezone().isoformat(timespec='seconds'); mstate = state.setdefault(machine, {})
     try:
         v = sample(machine, cfg); failed = False
@@ -134,7 +226,8 @@ def one(machine, cfg, state):
         breached['ram'] = (v['ram'], thresholds['ram']); breached['disk'] = (v['disk'], thresholds['disk'])
         breached['disk_gb'] = (v['disk_gb'], thresholds['disk_gb'])
         if 'charge_ma' in v: breached['charge_ma'] = (v['charge_ma'], thresholds.get('charge_ma', 300))
-    output = {'machine': machine, **v, 'status': 'unreachable' if failed else 'sampled'}
+    output = {'machine': machine, **v, 'status': 'unreachable' if failed else 'sampled',
+              'watch_mode': 'actions' if allow_actions else 'observe'}
     mstate['last_sample'] = now
     for metric, (value, limit) in breached.items():
         bad = failed if metric == 'unreachable' else (value > limit if metric in ('load','pressure') else value < limit)
@@ -147,16 +240,24 @@ def one(machine, cfg, state):
             names = top(cfg); note = ' ours-should-yield' if cfg.get('client') and not failed and v['load5'] > .75*v['cores'] else ''
             if metric == 'charge_ma': note = ' (on the charger but the battery is not gaining: swap cable/port, check the adapter, display holds, load)'
             msg = f"{datetime.datetime.now().strftime('%H:%M')} WAKE {machine} {metric} {value:.1f} (limit {limit:.1f}) for 5 min{note}; top: {'; '.join(names[:3])}"
-            ok = tell(msg); append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'opened','top':names,'told':ok})
-            rec['pending'] = None if ok else msg; rec['tries'] = 0
+            ok = tell(msg) if allow_actions else False
+            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'opened','top':names,
+                    'watch_mode': 'actions' if allow_actions else 'observe',
+                    'told':ok, 'notification':'sent' if ok else ('suppressed' if not allow_actions else 'failed')})
+            if allow_actions:
+                rec['pending'] = None if ok else msg; rec['tries'] = 0
         elif rec['open'] and rec['clean_count'] >= 5:
             rec.update(open=False, opened_at=None, last_told_at=None)
-            ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} CLEARED {machine} {metric}")
-            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'cleared','top':[],'told':ok})
+            ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} CLEARED {machine} {metric}") if allow_actions else False
+            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'cleared','top':[],
+                    'watch_mode': 'actions' if allow_actions else 'observe', 'told':ok,
+                    'notification':'sent' if ok else ('suppressed' if not allow_actions else 'failed')})
         elif rec['open'] and time.time() - (rec.get('last_told_at') or 0) >= 7200:
-            rec['last_told_at'] = time.time(); ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} STILL {machine} {metric} {value:.1f} (limit {limit:.1f})")
-            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'still','top':[],'told':ok})
-        if rec.get('pending'):  # 2 Oct 17:13: a wake whose tell failed (busy input box, pane moved) was never retried; Shaan's laptop sat at load 16 unannounced
+            rec['last_told_at'] = time.time(); ok = tell(f"{datetime.datetime.now().strftime('%H:%M')} STILL {machine} {metric} {value:.1f} (limit {limit:.1f})") if allow_actions else False
+            append({'at':now,'machine':machine,'metric':metric,'value':value,'threshold':limit,'state':'still','top':[],
+                    'watch_mode': 'actions' if allow_actions else 'observe', 'told':ok,
+                    'notification':'sent' if ok else ('suppressed' if not allow_actions else 'failed')})
+        if allow_actions and rec.get('pending'):  # retry only in explicit action mode
             rec['tries'] = rec.get('tries', 0) + 1
             if tell(rec['pending']): rec['pending'] = None
             elif rec['tries'] >= 3:
@@ -165,11 +266,13 @@ def one(machine, cfg, state):
     return output
 
 
-def once():
-    with open(os.path.join(HOUSE, 'health-machines.json')) as f: machines = json.load(f)
+@locked
+def once(allow_actions=False, include_remote=False):
+    with open(os.path.join(HOUSE, 'health-machines.json')) as f: configured = json.load(f)
+    machines = {k: c for k, c in configured.items() if c.get('local') or include_remote}
     state = load_state(); results = {}; lock = threading.Lock()
     def worker(k,c):
-        r = one(k,c,state)
+        r = one(k,c,state,allow_actions=allow_actions)
         with lock: results[k] = r
     threads = [threading.Thread(target=worker,args=x) for x in machines.items()]
     for t in threads: t.start()
@@ -179,20 +282,30 @@ def once():
     os.makedirs(CACHE, exist_ok=True)
     with open(STATE+'.tmp','w') as f: json.dump(state,f)
     os.replace(STATE+'.tmp', STATE)
+    # Observation must never auto-submit a new agent task, even if a stale policy enables it.
+    owner = maybe_owner(results) if allow_actions else {'status': 'disabled', 'reason': 'observe-only'}
+    print(json.dumps({'health_owner': owner, 'watch_scope': 'fleet' if include_remote else 'local',
+                      'remote_probes': sum(not c.get('local') for c in machines.values())}, sort_keys=True))
     # A0 2 Oct: builds/tests on the laptop outside `heavy` are throttled, their owner told, an issue kept (laptop-health unheavy)
-    try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'unheavy', '--enforce'], timeout=40).strip()[-600:])
-    except Exception as e: print(f'unheavy failed: {e}')
+    if allow_actions:
+        try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'unheavy', '--enforce', '--allow-actions'], timeout=40).strip()[-600:])
+        except Exception as e: print(f'unheavy failed: {e}')
     # A0 2 Oct 17:55: free memory before the laptop thrashes (laptop-health ramguard; dry-run unless ~/.cache/health-watch/ram-guard.on)
-    try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'ramguard'], timeout=90).splitlines()[0][:200])
-    except Exception as e: print(f'ramguard failed: {e}')
+    if allow_actions:
+        try: print(run([sys.executable, os.path.join(HOUSE, 'bin', 'laptop-health'), 'ramguard', '--allow-actions'], timeout=90).splitlines()[0][:200])
+        except Exception as e: print(f'ramguard failed: {e}')
 
 
 def main(args):
     plist = os.path.join(HOME,'Library/LaunchAgents',LABEL+'.plist')
-    if args == ['--once']: once(); return
+    if '--once' in args:
+        once(allow_actions='--allow-actions' in args, include_remote='--fleet' in args); return
     if args == ['status']:
         s = load_state()
-        for machine in json.load(open(os.path.join(HOUSE,'health-machines.json'))):
+        for machine, cfg in json.load(open(os.path.join(HOUSE,'health-machines.json'))).items():
+            if not cfg.get('local'):
+                print(f'{machine}: not monitored automatically by this laptop; use --once --fleet for an explicit fleet check')
+                continue
             alerts = [k for k,v in s.get(machine,{}).items() if isinstance(v, dict) and v.get('open')]
             print(f"{machine}: last sample {s.get(machine,{}).get('last_sample','unknown')}; open alerts {','.join(alerts) or 'none'}")
         return
@@ -205,6 +318,6 @@ def main(args):
         py='/opt/homebrew/bin/python3' if os.path.exists('/opt/homebrew/bin/python3') else sys.executable
         with open(plist,'w') as f: f.write(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array><string>{py}</string><string>{os.path.realpath(__file__)}</string><string>--once</string></array><key>StartInterval</key><integer>60</integer><key>Nice</key><integer>10</integer><key>ProcessType</key><string>Background</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict><key>StandardOutPath</key><string>{CACHE}/watch.log</string><key>StandardErrorPath</key><string>{CACHE}/watch.log</string></dict></plist>''')
         print('wrote '+plist+' (not loaded)'); return
-    print('usage: health-watch --once | status | --install | --uninstall'); sys.exit(2)
+    print('usage: health-watch --once [--fleet] [--allow-actions] | status | --install | --uninstall'); sys.exit(2)
 
 if __name__ == '__main__': main(sys.argv[1:])

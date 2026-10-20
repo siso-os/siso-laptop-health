@@ -2,6 +2,7 @@
 """RAM guard: parks only done/idle agents idle > 60 min that are not kept, focused or unresumable; the soak, Agent Zero and
 A0-DESK are never candidates; a busy input box or an agent that woke up is never typed into. 2 Oct: load 210 from RAM exhaustion."""
 import importlib.machinery, os, sys, tempfile, shutil, time
+from unittest.mock import patch
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
@@ -50,6 +51,10 @@ import subprocess
 importlib.machinery.SourceFileLoader("lh2", os.path.join(HOUSE, "bin/laptop-health")).load_module()
 lh2 = importlib.machinery.SourceFileLoader("lh2b", os.path.join(HOUSE, "bin/laptop-health")).load_module()
 tmp = tempfile.mkdtemp(prefix=".siso-ephemeral-landed.")
+# CI scratch can live inside a clean Git workspace. Keep the non-repo fixture
+# from discovering that parent, while preserving discovery inside tmp/r.
+boundary = patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": os.path.dirname(tmp)})
+boundary.start()
 try:
     run = lambda *c: subprocess.run(c, cwd=tmp + "/r", capture_output=True, text=True, check=True)
     os.makedirs(tmp + "/r"); run("git", "init", "-q", "-b", "main"); run("git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one")
@@ -61,4 +66,5 @@ try:
     assert lh2.landed(tmp) is False                                                  # not a repo
     print("ok: real landed() on a temp repo: clean+merged True; dirty, unmerged, not-a-repo False")
 finally:
+    boundary.stop()
     shutil.rmtree(tmp)

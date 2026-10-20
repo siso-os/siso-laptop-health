@@ -24,10 +24,11 @@
 
 Exit codes for `check`: 0 healthy, 1 degraded, 2 critical. Never kills an agent. See AGENTS.md for the playbook.
 """
-import collections, ctypes, datetime, glob, json, os, re, subprocess, sys, tempfile, time
+import collections, ctypes, datetime, fcntl, glob, json, os, re, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SEAT = os.environ.get("HEALTH_SEAT_HOUSE") or HOUSE.replace("/_data/worktrees/siso/live/", "/_data/worktrees/siso/main/")   # its .agents state (decisions/0028)
 NCPU = os.cpu_count() or 8
 
 
@@ -385,18 +386,19 @@ def tell(target, msg, dry=False):
 
 def hogs(dur):
     """Sample the load for dur s and group it by owning agent pane; non-agent load by kind. Runs as the user."""
-    run, samples, tot = sample_run(dur)
+    observed = {}
+    run, samples, tot = sample_run(dur, observed=observed)
     rows, tips = ps_rows(), load_tips()
     groups = {}
     for p, n in run.items():
-        if p not in rows:
-            key = ("gone", None)
+        if p == 0 or p not in rows or observed.get(p) is None:
+            key = ("kind", sampled_kind(p, rows, observed))
         else:
             a = agent_ancestor(p, rows)
             key = ("agent", a) if a else ("kind", kind_of(rows[p]["args"]))
         g = groups.setdefault(key, {"threads": 0.0, "procs": collections.Counter(), "tips": {}})
         g["threads"] += n / samples
-        if p in rows:
+        if p in rows and p != 0 and observed.get(p) is not None:
             g["procs"][p] += n / samples
             if key[0] == "agent" and p != key[1]:
                 chain, cur = [], p  # the process and its shells up to the agent: a loop's args live in the shell
@@ -561,7 +563,7 @@ BUILD_RX = re.compile(
     r"|(^|/)git( \S+)*? log\b.* -[SG]")
 HEAVY_RX = re.compile(r"(^|/)(heavy|tsc-inc|shot) ")
 UNHEAVY_MIN_AGE, UNHEAVY_TELL_EVERY = 30, 1800
-ISSUES = os.path.join(HOUSE, ".agents/issues.jsonl")
+ISSUES = os.path.join(SEAT, ".agents/issues.jsonl")
 
 
 def heavy_pids():
@@ -635,8 +637,8 @@ def safe_text(s):
 
 
 def cmd_unheavy(argv):
-    """List build/test processes outside `heavy`. --enforce: background-QoS them, tell the owner, record the issue."""
-    enforce, rows = "--enforce" in argv, ps_rows()
+    """List builds/tests outside heavy; --enforce --allow-actions enables priority changes and owner notices."""
+    enforce, rows = "--enforce" in argv and "--allow-actions" in argv, ps_rows()
     found = unheavy(rows)
     now = datetime.datetime.now().astimezone().isoformat(timespec="minutes")
     for pid, args, age, apid in found:
@@ -821,8 +823,8 @@ def resume_cmd(kind, sid, cwd):
 
 
 def cmd_ramguard(argv):
-    """Memory guard. `ramguard` = one pass (acts only when ram-guard.on exists and memory is short); `--list` = dry-run list only."""
-    live = os.path.exists(GUARD_ON) and "--list" not in argv
+    """Observe memory by default; actions require --allow-actions plus ram-guard.on. --list always observes."""
+    live = os.path.exists(GUARD_ON) and "--list" not in argv and "--allow-actions" in argv
     free, sw = available_mb(), memory()["swap_used_mb"] or 0
     short_now = free < RAM_MIN_MB or sw > SWAP_MAX_MB
     try:
@@ -969,7 +971,8 @@ def tree_facts(w, busy, measure=True):
 
 def sparse_profile(main):
     try:
-        return json.load(open(os.path.join(HOUSE, "sparse.json"))).get(os.path.basename(main.rstrip("/")))
+        profiles = json.load(open(os.path.join(HOUSE, "sparse.json")))
+        return profiles.get(os.path.realpath(main), profiles.get(os.path.basename(main.rstrip("/"))))
     except (OSError, ValueError):
         return None
 
@@ -1188,10 +1191,90 @@ def disk_cargo(argv):
     return 0
 
 WATCH_LABEL = "com.siso.laptop-health-watch"
+WATCH_CHURN_RETRY = 3600
 
 
+def watch_churn(entry, force=False):
+    """Do not spend ten seconds on every scheduled pass retrying a blind logger."""
+    path = os.path.join(CACHE, "churn-coverage.json")
+    try:
+        with open(path) as f:
+            coverage = json.load(f)
+        next_probe = float(coverage.get("next_probe_at", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        next_probe = 0
+    now = time.time()
+    entry.update(starts_per_min=None, pings=[])
+    if not force and next_probe > now:
+        entry.update(churn_coverage="blocked", churn_probe="cooldown", churn_next_probe_at=next_probe)
+        return
+    if not have_sudo():
+        entry.update(churn_coverage="unavailable", churn_probe="no_sudo")
+        return
+    events, args, parent = capture_events(10)
+    observed = bool(events)
+    entry.update(churn_coverage="observed" if observed else "blocked", churn_probe="sampled")
+    if observed:
+        entry["starts_per_min"] = len(events) * 6
+        entry["pings"] = [{"per_min": r, "cmd": k, "who": w}
+                          for r, k, w in pings(events, args, parent, 10, min_rate=60)[:5]]
+    next_probe = 0 if observed else time.time() + WATCH_CHURN_RETRY
+    entry["churn_next_probe_at"] = next_probe
+    os.makedirs(CACHE, exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump({"next_probe_at": next_probe, "coverage": entry["churn_coverage"]}, f)
+    os.replace(path + ".tmp", path)
+
+
+def watch_locked(fn):
+    """Hold a nonblocking per-watch lock through sampling and ledger write."""
+    def wrapped(argv):
+        if "--once" not in argv:
+            return fn(argv)
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, "watch.lock"), "w") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"status": "skipped", "reason": "watch lock held"}))
+                return 0
+            try:
+                return fn(argv)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return wrapped
+
+
+def watch_detail_policy(la, free_pct, force=False):
+    """Diagnose changed pressure; an unchanged incident needs at most one sample/hour."""
+    path = os.path.join(CACHE, "detail-policy.json")
+    try:
+        with open(path) as f:
+            previous = json.load(f)
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError):
+        previous = {}
+    pressure = []
+    if not la or free_pct is None:
+        pressure.append("unknown")
+    if la and la[0] >= NCPU:
+        pressure.append("load-critical" if la[0] >= 2 * NCPU else "load")
+    if free_pct is not None and free_pct <= 30:
+        pressure.append("memory-critical" if free_pct <= 15 else "memory")
+    now = time.time()
+    last = previous.get("last_detail", 0)
+    if not isinstance(last, (int, float)) or last > now:
+        last = 0
+    changed = pressure != previous.get("pressure")
+    due = force or bool(pressure) and (changed or now - last >= 3600)
+    reason = "explicit" if force else "pressure-changed" if pressure and changed else "pressure-refresh" if due else "healthy" if not pressure else "unchanged-pressure"
+    return due, reason, {"pressure": pressure, "last_detail": now if due else last}
+
+
+@watch_locked
 def cmd_watch(argv):
-    """The persistent job. --once: one pass (what launchd runs every 10 min). --install / --uninstall the LaunchAgent."""
+    """Scheduled --once passes observe only. --allow-actions opts into actions; install/uninstall manage the LaunchAgent."""
     plist = os.path.join(HOME, "Library/LaunchAgents", WATCH_LABEL + ".plist")
     if "--install" in argv:
         os.makedirs(os.path.join(CACHE), exist_ok=True)
@@ -1221,12 +1304,17 @@ def cmd_watch(argv):
             os.remove(plist)
         print("uninstalled"); return 0
     if "--once" not in argv:
-        print("usage: laptop-health watch --once | --install | --uninstall\nlast passes:")
+        print("usage: laptop-health watch --once [--diagnose] | --install | --uninstall\nlast passes:")
         try:
             for line in open(os.path.join(CACHE, "watch.jsonl")).readlines()[-6:]:
                 e = json.loads(line)
-                print(f"  {e['at']}  {e['level']:<8} load {e['load'][0]:.1f}  free {e['free_mb']} MB  "
-                      + f"starts {e.get('starts_per_min', '?')}/min  " + (f"told {len(e['told'])}  " if e["told"] else ""))
+                free = f"{e['free_mb']} MB" if e.get("free_mb") is not None else "unmeasured"
+                starts = f"{e['starts_per_min']}/min" if e.get("starts_per_min") is not None else "unmeasured"
+                print(f"  {e['at']}  {e['level']:<8} load {e['load'][0]:.1f}  free {free}  "
+                      + f"starts {starts}  " + (f"told {len(e['told'])}  " if e["told"] else ""))
+                if e.get("free_mb") is None or e.get("starts_per_min") is None:
+                    print(f"{'':16}diagnostics {e.get('diagnostics', 'unknown')} ({e.get('diagnostics_reason', 'unknown')}); "
+                          + f"churn {e.get('churn_coverage', 'unknown')} ({e.get('churn_probe', 'unknown')})")
                 for h in e["hogs"][:3]:
                     print(f"{'':16}{h['threads']:5.2f} threads  {h['who'][:100]}" + (f"  waste: {','.join(h['tips'])}" if h["tips"] else ""))
                 for pg in e.get("pings", [])[:3]:
@@ -1234,35 +1322,49 @@ def cmd_watch(argv):
         except OSError:
             print("  none yet")
         return 0
-    la, mem, pw = loadavg(), memory(), power()
-    groups, rows, samples, avg = hogs(10)
-    entry = {"at": datetime.datetime.now().strftime("%m-%d %H:%M"), "load": la, "free_mb": mem["free_mb"], "free_gb": free_gb()[0],
-             "compressor_mb": mem["compressor_mb"], "power": pw["source"], "lpm": pw["low_power_mode_now"], "hogs": [], "told": []}
-    entry["level"] = "critical" if pw["low_power_mode_now"] and la[0] > NCPU else "degraded" if la[0] > 2 * NCPU or (mem["free_mb"] or 999) < 300 else "ok"
+    allow_actions = "--allow-actions" in argv
+    la = loadavg()
+    free_text = sh(["memory_pressure"], timeout=5)
+    free_match = re.search(r"free percentage:\s*(\d+)%", free_text)
+    free_pct = int(free_match.group(1)) if free_match else None
+    due, reason, detail_state = watch_detail_policy(la, free_pct,
+        force=allow_actions or "--diagnose" in argv or "--probe-churn" in argv)
+    # A deferred pass must not run top, disk scans or power utilities either.
+    mem = memory() if due else {"free_mb": None, "compressor_mb": None}
+    pw = power() if due else {"source": None, "low_power_mode_now": None}
+    groups, rows, samples, avg = hogs(10) if due else ({}, {}, [], 0)
+    entry = {"at": datetime.datetime.now().strftime("%m-%d %H:%M"), "watch_mode": "actions" if allow_actions else "observe",
+             "load": la, "free_mb": mem["free_mb"], "free_gb": free_gb()[0] if due else None,
+             "compressor_mb": mem["compressor_mb"], "power": pw["source"], "lpm": pw["low_power_mode_now"], "hogs": [], "told": [],
+             "memory_pressure_free_pct": free_pct, "diagnostics": "sampled" if due else "deferred", "diagnostics_reason": reason}
+    entry["level"] = "critical" if pw["low_power_mode_now"] and la[0] > NCPU else "degraded" if detail_state["pressure"] or (mem["free_mb"] or 999) < 300 else "ok"
     for (k, key), g in sorted(groups.items(), key=lambda kv: -kv[1]["threads"])[:6]:
         who = agent_label(agent_info(key, rows)) if k == "agent" else (key or "short-lived")
         entry["hogs"].append({"threads": round(g["threads"], 2), "who": who, "tips": list(g["tips"])})
         if k != "agent" or g["threads"] < 1.0:
             continue
         i = agent_info(key, rows)
-        if i.get("pane") and g["tips"]:
+        if i.get("pane") and g["tips"] and allow_actions:
             r = tell_waste(i, g)
             if r:
                 entry["told"].append(r)
-    if have_sudo():
-        events, args, parent = capture_events(10)
-        # under launchd eslogger gets no events without Full Disk Access for the python it runs from: say so, not "0"
-        entry["starts_per_min"] = len(events) * 6 if events else None
-        entry["pings"] = [{"per_min": r, "cmd": k, "who": w} for r, k, w in pings(events, args, parent, 10, min_rate=60)[:5]]
-    strays = find_strays()
-    entry["strays"] = collections.Counter(c for c, *_ in strays)
-    for cat, pid, why, fix in strays:  # only our own leftovers are stopped unattended; `clean` is for the rest
-        if cat == "monitors":
+        elif i.get("pane") and g["tips"]:
+            entry.setdefault("notifications_suppressed", []).append({"who": who, "tips": list(g["tips"])})
+    if due:
+        watch_churn(entry, force="--probe-churn" in argv)
+    else:
+        entry.update(churn_probe="not-needed", churn_coverage="not-sampled", starts_per_min=None, pings=[])
+    strays = find_strays() if due else []
+    entry["strays"] = collections.Counter(c for c, *_ in strays) if due else None
+    for cat, pid, why, fix in strays:  # only our own leftovers are stopped with explicit action opt-in
+        if allow_actions and cat == "monitors":
             subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)], capture_output=True)
-    if entry["free_gb"] < DISK_WARN_GB and not sh(["pgrep", "-x", "rustc"]).strip():
+    if allow_actions and entry["free_gb"] < DISK_WARN_GB and not sh(["pgrep", "-x", "rustc"]).strip():
         kb, n = clear_stale_cargo(cargo_roots())  # build cache only; nothing an agent wrote by hand
         entry["cargo_cleared_mb"] = kb // 1024
     os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "detail-policy.json"), "w") as f:
+        json.dump(detail_state, f)
     with open(os.path.join(CACHE, "watch.jsonl"), "a") as f:
         f.write(json.dumps(entry) + "\n")
     print(json.dumps(entry))
@@ -1379,24 +1481,55 @@ def cmd_strays(argv):
     return 0
 
 
-def sample_run(dur, every=0.25):
+def sampled_kind(pid, rows, observed):
+    """Retained names are diagnostics, never a live PID or owning-agent claim."""
+    if pid == 0:
+        return "macOS (kernel_task)"
+    if pid in observed and observed[pid] is None:
+        return "identity changed (unattributed)"
+    if pid in rows:
+        return kind_of(rows[pid]["args"])
+    identity = observed.get(pid)
+    return f"short-lived: {identity[2]}" if identity and identity[2] else "short-lived (identity unavailable)"
+
+
+def sample_run(dur, every=0.25, observed=None):
     """Runnable threads per pid, sampled with libproc (root sees every process; a user sees their own)."""
     lib = ctypes.CDLL("/usr/lib/libproc.dylib")
 
     class TI(ctypes.Structure):
         _fields_ = [(n, ctypes.c_uint64) for n in ("vs", "rs", "tu", "ts", "tu2", "ts2")] + \
                    [(n, ctypes.c_int32) for n in ("pol", "flt", "pgin", "cow", "ms", "mr", "scm", "scu", "csw", "thn", "run", "pri")]
+    # macOS sys/proc_info.h: PROC_PIDTASKALLINFO returns BSD identity and
+    # task counters in the same syscall as the old task-only probe.
+    class BI(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in ("flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")] + \
+                   [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + \
+                   [(n, ctypes.c_uint32) for n in ("nfiles", "pgid", "pjobc", "tdev", "tpgid", "nice")] + \
+                   [("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+    class AI(ctypes.Structure):
+        _fields_ = [("bsd", BI), ("task", TI)]
+
     buf = (ctypes.c_int * 8192)(); me = os.getpid()
     run = collections.Counter(); samples = 0; tot = []
+    # Reuse the native buffer rather than allocating a structure per process.
+    info = AI(); info_ptr = ctypes.byref(info); info_size = ctypes.sizeof(info)
     t0 = time.time()
     while time.time() - t0 < dur:
         n = lib.proc_listallpids(buf, ctypes.sizeof(buf)); s = 0
         for p in buf[:n]:
             if p == me:
                 continue
-            t = TI()
-            if lib.proc_pidinfo(p, 4, 0, ctypes.byref(t), ctypes.sizeof(t)) == ctypes.sizeof(t) and t.run:
-                run[p] += t.run; s += t.run
+            if lib.proc_pidinfo(p, 2, 0, info_ptr, info_size) == info_size and info.task.run:
+                run[p] += info.task.run; s += info.task.run
+                if observed is not None:
+                    b = info.bsd
+                    name = (b.name or b.comm).decode("utf-8", "replace")
+                    identity = (b.start_sec, b.start_usec, name)
+                    if p not in observed:
+                        observed[p] = identity
+                    elif observed[p] != identity:
+                        observed[p] = None  # PID reuse/exec: do not invent a single identity.
         tot.append(s); samples += 1
         time.sleep(every)
     return run, samples, tot
@@ -1406,19 +1539,21 @@ def cmd_load(argv):
     dur = float(argv[0]) if argv and argv[0].replace(".", "").isdigit() else 30
     if os.geteuid() != 0 and have_sudo():
         return subprocess.call(["sudo", "-n", sys.executable, os.path.realpath(__file__), "load", str(dur)])
-    run, samples, tot = sample_run(dur)
+    observed = {}
+    run, samples, tot = sample_run(dur, observed=observed)
     rows = ps_rows()
     allrun = max(sum(run.values()), 1)
     print(f"{samples} samples over {dur:.0f}s: on average {sum(tot)/samples:.1f} threads wanted a core (peak {max(tot)}); {NCPU} cores\n")
     grp = collections.Counter()
     for p, n in run.items():
-        grp[kind_of(rows[p]["args"]) if p in rows else "short-lived (already gone)"] += n
+        grp[sampled_kind(p, rows, observed)] += n
     print("share of the load by kind:")
     for k, n in grp.most_common(10):
         print(f"  {100*n/allrun:5.1f}%  {n/samples:5.2f} threads  {k}")
     print("\ntop processes:")
     for p, n in run.most_common(12):
-        print(f"  {100*n/allrun:5.1f}%  {p:<6} {short(rows[p]['args'], 95) if p in rows else '(gone)'}")
+        label = rows[p]["args"] if p in rows and observed.get(p) is not None else sampled_kind(p, rows, observed)
+        print(f"  {100*n/allrun:5.1f}%  {p:<6} {short(label, 95)}")
     return 0
 
 
@@ -1452,15 +1587,22 @@ def capture_events(dur):
             proc = subprocess.Popen(["sudo", "-n", "sh", "-c", f"echo $$ > {pidf}; exec /usr/bin/eslogger exec fork"],
                                     stdout=f, stderr=subprocess.DEVNULL)
             try:
-                time.sleep(dur)
-            finally:
-                es = open(pidf).read().strip() if os.path.exists(pidf) else str(proc.pid)
-                subprocess.run(["sudo", "-n", "kill", "-INT", es], capture_output=True)
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=dur)
+                    # An exited logger did not cover the requested window. Even
+                    # partial output must not become a rate for the full window.
+                    return [], {}, {}
                 except subprocess.TimeoutExpired:
-                    subprocess.run(["sudo", "-n", "kill", "-KILL", es], capture_output=True)
-                    proc.wait(timeout=5)
+                    pass
+            finally:
+                if proc.poll() is None:
+                    es = open(pidf).read().strip() if os.path.exists(pidf) else str(proc.pid)
+                    subprocess.run(["sudo", "-n", "kill", "-INT", es], capture_output=True)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        subprocess.run(["sudo", "-n", "kill", "-KILL", es], capture_output=True)
+                        proc.wait(timeout=5)
         args, parent, events = {}, {}, []
         for line in sh("ps -Ao pid=,ppid=,args=").splitlines():
             p = line.split(None, 2)
@@ -1531,7 +1673,10 @@ def cmd_churn(argv):
             ex[lab][" ".join(short(args.get(pid, "?")).split()[:3])[:60]] += 1
         elif pid not in execd:
             forks_only[lab] += 1
-    total = max(sum(cnt.values()), 1)
+    total = sum(cnt.values())
+    if not total:
+        print(f"BLOCKED: no complete fork/exec capture (requested {dur}s); churn coverage unknown; rate unavailable\n")
+        return 1
     print(f"{total} process starts (fork+exec events) in {dur}s = {total*60/dur:.0f}/min\n")
     for lab, n in cnt.most_common(12):
         eg = ", ".join(f"{k} x{v}" for k, v in ex[lab].most_common(2))
