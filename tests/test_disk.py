@@ -2,9 +2,10 @@
 """Stale cargo incremental caches go; the ones a build touched recently stay; nothing goes while rustc runs.
 1 Oct: one Oracle worktree held 201 stale incremental folders (8.7 GB) and the disk fell to 15.6 GB free."""
 import importlib.machinery, os, shutil, sys, tempfile, time
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh", os.path.join(HOUSE, "bin/laptop-health"))
 lh.CACHE = tmp = tempfile.mkdtemp(prefix=".siso-ephemeral-cargo-test.")
 try:
     inc = os.path.join(tmp, "repo", "oracle-rs", "target", "debug", "incremental")

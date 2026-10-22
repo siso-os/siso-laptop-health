@@ -1,9 +1,10 @@
 """Boundaries: local-only work, native metrics, no auto-prompt, pressure transitions."""
 import contextlib, importlib.machinery, io, json, os, tempfile
+from srcload import load
 from types import SimpleNamespace
 HOUSE = os.path.dirname(os.path.dirname(__file__))
-hw = importlib.machinery.SourceFileLoader('hw_cost', os.path.join(HOUSE, 'bin/health-watch')).load_module()
-lh = importlib.machinery.SourceFileLoader('lh_cost', os.path.join(HOUSE, 'bin/laptop-health')).load_module()
+hw = load('hw_cost', os.path.join(HOUSE, 'bin/health-watch'))
+lh = load('lh_cost', os.path.join(HOUSE, 'bin/laptop-health'))
 vm = '''Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free: 10.
 Pages inactive: 20.

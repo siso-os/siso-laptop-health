@@ -1,5 +1,6 @@
 """Scheduled logger retries back off without inventing a zero rate or losing samples."""
 import importlib.machinery
+from srcload import load
 import json
 import os
 import subprocess
@@ -7,7 +8,7 @@ import tempfile
 from unittest.mock import patch
 
 HOUSE = os.path.dirname(os.path.dirname(__file__))
-lh = importlib.machinery.SourceFileLoader("lh_backoff", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh_backoff", os.path.join(HOUSE, "bin/laptop-health"))
 with tempfile.TemporaryDirectory(prefix=".siso-churn-backoff-") as tmp:
     lh.CACHE = tmp
     clock = [1000.0]
@@ -49,7 +50,7 @@ print("ok: one blind probe, skipped cooldown, expiry, forced recovery, unavailab
 
 # Exercise the real capture path: an early logger exit never waits out the
 # window, signals a dead PID, snapshots processes, or reports a partial rate.
-lh = importlib.machinery.SourceFileLoader("lh_capture", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh_capture", os.path.join(HOUSE, "bin/laptop-health"))
 event = {"process": {"audit_token": {"pid": 10}, "ppid": 1},
          "event": {"exec": {"target": {"audit_token": {"pid": 11}}, "args": ["fixture"]}}}
 

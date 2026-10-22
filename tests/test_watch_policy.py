@@ -1,9 +1,10 @@
 """Policy tests: watcher passes observe by default and action opt-in is explicit."""
 import contextlib, importlib.machinery, io, json, os, tempfile
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(__file__))
-hw = importlib.machinery.SourceFileLoader("hw_policy", os.path.join(HOUSE, "bin/health-watch")).load_module()
-lh = importlib.machinery.SourceFileLoader("lh_policy", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+hw = load("hw_policy", os.path.join(HOUSE, "bin/health-watch"))
+lh = load("lh_policy", os.path.join(HOUSE, "bin/laptop-health"))
 
 tmp = tempfile.mkdtemp(prefix=".siso-watch-policy-")
 try:
