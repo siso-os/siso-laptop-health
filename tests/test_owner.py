@@ -3,9 +3,10 @@
 session's herdr pane with the local-whisper tip, `tell` must never type into a pane whose input box has text, and
 `pings` must name the agent that keeps starting the same command. Everything is simulated; nothing is sent."""
 import importlib.machinery, os
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh", os.path.join(HOUSE, "bin/laptop-health"))
 
 AGENT, LOOP, WHISPER, HERDR = 100, 200, 300, 400
 ROWS = {AGENT: {"ppid": 50, "age": 9000, "cpu": 1, "args": "/Users/x/.local/bin/claude"},

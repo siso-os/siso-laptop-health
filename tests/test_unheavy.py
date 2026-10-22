@@ -2,9 +2,10 @@
 """Builds and tests outside `heavy` are found once per tree; queued, slotted, young and IDE ones are left alone; one issue
 per owner per day. 2 Oct: load 16 on 8 cores with the soak's ffmpeg on the laptop; A0 asked for this rule to be enforced."""
 import importlib.machinery, json, os, shutil, sys, tempfile
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh", os.path.join(HOUSE, "bin/laptop-health"))
 tmp = tempfile.mkdtemp(prefix=".siso-ephemeral-unheavy-test.")
 try:
     lh.ISSUES = os.path.join(tmp, "issues.jsonl")

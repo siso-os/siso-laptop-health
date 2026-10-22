@@ -3,9 +3,10 @@
 25 Sep: `clean` stopped the :8812 curated board because keep.txt was matched against the command line only.
 Simulates two old, ownerless, client-less servers: the curated board (kept) and a docs http.server (flagged)."""
 import importlib.machinery, os, sys
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh", os.path.join(HOUSE, "bin/laptop-health"))
 
 BOARD, DOCS = 900001, 900002
 CWD = {BOARD: "/Users/x/SISO_Workspace/Great_Library_of_SISO/banks/siso-ui-base/registry/curated",

@@ -6,10 +6,13 @@ Shaan, 6 Oct ~23:15: "the fan's going off like crazy and I feel like it's some z
 
   waiters    a Bash tool shell from an ended Claude session (parent gone, up 1 h+) whose whole tree only waits
              (tail -F, grep, cut, sleep...): e.g. a 4-day-old `tail -F a0/inbox.log | grep` nobody reads.
-  launchers  an `npm exec` / `npx` / `pnpm exec|dlx` whose starter is gone (up 6 h+) and whose dev server (vite, next,
+  launchers  an `npm exec` / `npx` / `pnpm exec|dlx` whose starter is gone (up 2 h+) and whose dev server (vite, next,
              webpack, astro, storybook) has no client on any port. strays only looks at a server whose own parent is gone.
   ghosts     Agent Base host records (~/.local/state/agent-base/hosts/*.json) whose host process is dead. Reported only:
              they make a chat look alive to anyone counting the fleet.
+
+Runs every 15 min (launchd com.siso.zombies, --apply waiters,launchers). Shaan, 22 Oct: the fan; a `next dev` left
+behind by a seat held 3.9 GB for 3 h on the 16 GB laptop and pushed it into swap.
 
 Never touched: anything with a living parent (so nothing under a live chat, agent CLI or app), launchd services,
 keep.txt matches (command line or folder), `npm start` style services (camofox on :9377 is one).
@@ -69,7 +72,7 @@ def find(rows=None):
             if all(WAIT_ONLY.match(c) for c in cmds) and len(t) > 1:
                 what = " | ".join(lh.short(rows[q]["args"], 50) for q in t[1:4] if q in rows)
                 found.append(("waiters", p, f"Bash shell from an ended Claude session, up {r['age'] / 3600:.1f}h, only waits: {what}"))
-        elif LAUNCHER.search(r["args"]) and r["age"] > 6 * 3600:
+        elif LAUNCHER.search(r["args"]) and r["age"] > 2 * 3600:
             servers = [q for q in t if q in rows and DEV_SERVER.search(rows[q]["args"])]
             ports = sorted({pt for q in t for pt in listen.get(q, ())})
             cwd = cwd_of(p)

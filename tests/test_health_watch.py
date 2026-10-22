@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import importlib.machinery, json, os, shutil, tempfile
+from srcload import load
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-hw = importlib.machinery.SourceFileLoader('hw', os.path.join(HOUSE, 'bin/health-watch')).load_module()
+hw = load('hw', os.path.join(HOUSE, 'bin/health-watch'))
 linux = '''4\n0.50 1.00 0.70 1/100 1\nsome avg10=2.00 avg60=3.00 avg300=1.00 total=5\nMemTotal: 1000 kB\nMemAvailable: 500 kB\nFilesystem 1024-blocks Used Available Capacity Mounted on\n/dev/root 1000 500 500 50% /\n'''
 mac = '''8\n{ 0.80 1.00 1.20 }\nMach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 10.\nPages inactive: 20.\nPages speculative: 5.\nPages purgeable: 5.\n1000000\nFilesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 1000 500 500 50% /System/Volumes/Data\n'''
 assert hw.parse_sample('linux', linux) == {'cores':4,'load1':0.5,'load5':1.0,'pressure':3.0,'ram':50.0,'disk':50.0,'disk_gb':500/1048576}

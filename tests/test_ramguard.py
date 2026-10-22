@@ -2,10 +2,11 @@
 """RAM guard: parks only done/idle agents idle > 60 min that are not kept, focused or unresumable; the soak, Agent Zero and
 A0-DESK are never candidates; a busy input box or an agent that woke up is never typed into. 2 Oct: load 210 from RAM exhaustion."""
 import importlib.machinery, os, sys, tempfile, shutil, time
+from srcload import load
 from unittest.mock import patch
 
 HOUSE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-lh = importlib.machinery.SourceFileLoader("lh", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh", os.path.join(HOUSE, "bin/laptop-health"))
 A = lambda pane, status, title, cwd="/x", idle=200, focused=False, sid="s-1": {
     "pane_id": pane, "agent_status": status, "terminal_title_stripped": title, "cwd": cwd, "agent": "claude", "focused": focused,
     "agent_session": {"value": sid}, "_idle": idle}
@@ -48,8 +49,8 @@ print("ok: parks only stale non-kept idle agents; soak/A0/A0-DESK/HEALTH kept; n
 
 # the real landed(): a temp repo whose HEAD is in origin/main and clean is landed; an extra commit or a dirty file is not
 import subprocess
-importlib.machinery.SourceFileLoader("lh2", os.path.join(HOUSE, "bin/laptop-health")).load_module()
-lh2 = importlib.machinery.SourceFileLoader("lh2b", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+load("lh2", os.path.join(HOUSE, "bin/laptop-health"))
+lh2 = load("lh2b", os.path.join(HOUSE, "bin/laptop-health"))
 tmp = tempfile.mkdtemp(prefix=".siso-ephemeral-landed.")
 # CI scratch can live inside a clean Git workspace. Keep the non-repo fixture
 # from discovering that parent, while preserving discovery inside tmp/r.

@@ -1,5 +1,6 @@
 """Runnable samples retain names, preserve counts, and never invent live owners."""
 import collections
+from srcload import load
 import ctypes
 import importlib.machinery
 import os
@@ -7,7 +8,7 @@ import types
 from unittest.mock import patch
 
 HOUSE = os.path.dirname(os.path.dirname(__file__))
-lh = importlib.machinery.SourceFileLoader("lh_sampling", os.path.join(HOUSE, "bin/laptop-health")).load_module()
+lh = load("lh_sampling", os.path.join(HOUSE, "bin/laptop-health"))
 
 
 class Native:
